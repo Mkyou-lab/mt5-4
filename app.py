@@ -11,7 +11,7 @@ import numpy as np
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
-# ========== BACKGROUND EVENT LOOP (fixes "no running event loop") ==========
+# ========== BACKGROUND EVENT LOOP ==========
 bg_loop = None
 def _start_bg_loop():
     global bg_loop
@@ -47,7 +47,7 @@ def add_log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     entry = f"[{ts}] {msg}"
     bot_state["logs"].append(entry)
-    if len(bot_state["logs"]) > 80:
+    if len(bot_state["logs"]) > 100:
         bot_state["logs"].pop(0)
     logging.info(msg)
 
@@ -70,13 +70,16 @@ class MetaApiEngine:
         self.connection = None
 
     async def connect_with_credentials(self, token, login, password, server, platform, region):
-        """Auto-create / connect using login + password + server"""
         try:
-            add_log(f"Connecting with credentials | Server: {server} | Region: {region}")
-            self.api = MetaApi(token, domain=f"app.metaapi.cloud" if region == "default" else None)
+            add_log(f"Connecting → Server: {server} | Login: {login}")
+            self.api = MetaApi(token)          # ← FIXED (no domain argument)
 
-            # 1. Look for existing account first
-            accounts = await self.api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination()
+            # Try to find existing account first
+            try:
+                accounts = await self.api.metatrader_account_api.get_accounts()
+            except:
+                accounts = await self.api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination()
+
             existing = None
             for acc in accounts:
                 if str(acc.login) == str(login) and server.lower() in str(acc.server).lower():
@@ -84,25 +87,24 @@ class MetaApiEngine:
                     break
 
             if existing:
-                add_log(f"Found existing MetaApi account: {existing.id}")
+                add_log(f"Using existing MetaApi account: {existing.id}")
                 self.account = existing
             else:
-                add_log("Creating new account on MetaApi (this can take 20-40 seconds)...")
+                add_log("Creating new cloud account on MetaApi (20-50 sec)...")
                 payload = {
-                    "name": f"Railway-Bot-{login}",
+                    "name": f"Bot-{login}",
                     "type": "cloud",
                     "login": str(login),
                     "password": str(password),
                     "server": str(server),
                     "platform": "mt5" if "5" in platform.lower() else "mt4",
-                    "magic": 123456,
-                    "quoteStreamingIntervalInSeconds": 2.5
+                    "magic": 123456
                 }
                 if region and region != "default":
                     payload["region"] = region
 
                 self.account = await self.api.metatrader_account_api.create_account(payload)
-                add_log(f"Account created: {self.account.id}")
+                add_log(f"Account created successfully: {self.account.id}")
 
             return await self._finish_connection()
 
@@ -115,7 +117,6 @@ class MetaApiEngine:
             return False, error
 
     async def connect_with_account_id(self, token, account_id):
-        """Recommended reliable method - just Token + Account ID"""
         try:
             add_log(f"Connecting with Account ID: {account_id}")
             self.api = MetaApi(token)
@@ -134,24 +135,23 @@ class MetaApiEngine:
         bot_state["account_type"] = str(getattr(self.account, "type", "cloud")).upper()
 
         if self.account.state != "DEPLOYED":
-            add_log("Deploying account terminal (20-60 seconds)...")
+            add_log("Deploying terminal (please wait 20-60 seconds)...")
             await self.account.deploy()
 
-        add_log("Waiting for broker connection...")
+        add_log("Waiting for broker connection & synchronization...")
         await self.account.wait_connected()
 
         self.connection = self.account.get_rpc_connection()
         await self.connection.connect()
         await self.connection.wait_synchronized()
 
-        # Get account info
         info = await self.connection.get_account_information()
         bot_state["balance"] = float(info.get("balance", 0))
         bot_state["equity"] = float(info.get("equity", 0))
         bot_state["is_connected"] = True
         bot_state["status_msg"] = f"Online • {bot_state['account_type']}"
         bot_state["last_error"] = ""
-        add_log("✅ SUCCESS! MT5/MT4 Connected & Synchronized")
+        add_log("✅ SUCCESS! Connected & Synchronized with broker")
         return True, "Connected successfully"
 
     async def resolve_symbol(self, symbol):
@@ -159,13 +159,15 @@ class MetaApiEngine:
             symbols = await self.connection.get_symbols()
             if symbol in symbols:
                 return symbol
-            clean = symbol.replace("/", "").replace("_", "").upper()
+            clean = symbol.replace("/", "").replace("_", "").replace(".", "").upper()
             for s in symbols:
-                if clean in s.replace("/", "").replace("_", "").replace(".", "").upper():
-                    add_log(f"Symbol resolved: {symbol} → {s}")
+                s_clean = s.replace("/", "").replace("_", "").replace(".", "").upper()
+                if clean in s_clean or s_clean in clean:
+                    add_log(f"Symbol auto-resolved: {symbol} → {s}")
                     return s
             return symbol
-        except:
+        except Exception as e:
+            add_log(f"Symbol resolve warning: {e}")
             return symbol
 
     async def fetch_candles(self, symbol, timeframe, count=100):
@@ -180,6 +182,7 @@ class MetaApiEngine:
                     symbol, timeframe, datetime.now(timezone.utc), count
                 )
             if not candles:
+                add_log(f"No candle data for {symbol}")
                 return None
             df = pd.DataFrame(candles)
             for col in ["open", "high", "low", "close"]:
@@ -200,7 +203,7 @@ class MetaApiEngine:
             sl = entry - sl_pips * point if action == "BUY" else entry + sl_pips * point
             tp = entry + tp_pips * point if action == "BUY" else entry - tp_pips * point
 
-            add_log(f"Placing {action} {symbol} | Lot {lot} @ {entry}")
+            add_log(f"Placing {action} {symbol} | Lot: {lot} @ {entry:.5f}")
             if action == "BUY":
                 res = await self.connection.create_market_buy_order(
                     symbol, lot, round(sl, digits), round(tp, digits)
@@ -209,13 +212,14 @@ class MetaApiEngine:
                 res = await self.connection.create_market_sell_order(
                     symbol, lot, round(sl, digits), round(tp, digits)
                 )
-            add_log(f"Trade opened! Result: {res}")
+            add_log(f"✅ Trade opened! {res}")
         except Exception as e:
-            add_log(f"Trade failed: {e}")
+            add_log(f"❌ Trade failed: {e}")
 
     async def trading_loop(self):
         add_log("🚀 Trading engine started")
         bot_state["actual_symbol"] = await self.resolve_symbol(bot_state["symbol"])
+        add_log(f"Trading symbol: {bot_state['actual_symbol']}")
 
         while bot_state["is_running"] and bot_state["is_connected"]:
             try:
@@ -242,9 +246,10 @@ class MetaApiEngine:
                     bot_state["last_signal"] = f"{signal} (RSI {rsi:.1f})"
 
                     positions = await self.connection.get_positions()
-                    my_pos = [p for p in positions if p["symbol"] == bot_state["actual_symbol"]]
+                    my_pos = [p for p in positions if p.get("symbol") == bot_state["actual_symbol"]]
 
                     if len(my_pos) < bot_state["max_trades"] and signal in ("BUY", "SELL"):
+                        add_log(f"Strategy signal: {signal}")
                         await self.execute_trade(
                             signal,
                             bot_state["actual_symbol"],
@@ -279,10 +284,10 @@ body{background:#0b0e14;color:#adbac7;font-family:system-ui}
 .form-control:focus,.form-select:focus{background:#0d1117;color:#fff;border-color:#1f6feb;box-shadow:none}
 .btn-success{background:#238636;border:none}
 .btn-danger{background:#da3633;border:none}
-.log-box{background:#010409;border:1px solid #2d333b;height:240px;overflow-y:auto;font-family:monospace;font-size:12px;padding:12px;border-radius:8px;color:#3fb950}
+.log-box{background:#010409;border:1px solid #2d333b;height:260px;overflow-y:auto;font-family:monospace;font-size:12px;padding:12px;border-radius:8px;color:#3fb950}
 .status-online{color:#3fb950}
 .status-offline{color:#f85149}
-.error-box{background:#2d1515;border:1px solid #f85149;color:#ff7b72;padding:10px;border-radius:8px;font-size:13px;display:none}
+.error-box{background:#2d1515;border:1px solid #f85149;color:#ff7b72;padding:10px;border-radius:8px;font-size:13px;display:none;margin-bottom:12px}
 </style>
 </head>
 <body class="p-3">
@@ -293,25 +298,24 @@ body{background:#0b0e14;color:#adbac7;font-family:system-ui}
   <span id="statusBadge" class="status-offline">● Offline</span>
 </div>
 
-<ul class="nav nav-pills mb-3" id="tabs">
+<ul class="nav nav-pills mb-3">
   <li class="nav-item"><button class="nav-link active" data-tab="connect">1. Connect</button></li>
   <li class="nav-item"><button class="nav-link" data-tab="strategy">2. Strategy</button></li>
   <li class="nav-item"><button class="nav-link" data-tab="live">3. Live Trade</button></li>
 </ul>
 
-<!-- CONNECT TAB -->
+<!-- CONNECT -->
 <div id="tab-connect" class="tab-pane">
   <div class="card p-3">
     <div class="mb-3">
       <label class="form-label">MetaApi Token</label>
       <input type="password" id="token" class="form-control" placeholder="eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9...">
-      <small class="text-muted">Get it free at app.metaapi.cloud → API Access</small>
     </div>
 
     <div class="mb-3">
       <label class="form-label">Connection Method</label>
       <select id="method" class="form-select" onchange="toggleMethod()">
-        <option value="account_id">Recommended: Account ID (most reliable)</option>
+        <option value="account_id">Recommended: Account ID only</option>
         <option value="credentials">Login + Password + Server</option>
       </select>
     </div>
@@ -319,8 +323,8 @@ body{background:#0b0e14;color:#adbac7;font-family:system-ui}
     <div id="box-account-id">
       <div class="mb-3">
         <label class="form-label">MetaApi Account ID</label>
-        <input type="text" id="accountId" class="form-control" placeholder="Paste Account ID from MetaApi dashboard">
-        <small class="text-muted">Create account manually at app.metaapi.cloud → Accounts → Add account</small>
+        <input type="text" id="accountId" class="form-control" placeholder="Paste Account ID here">
+        <small class="text-muted">Create the account first at app.metaapi.cloud → Accounts</small>
       </div>
     </div>
 
@@ -337,11 +341,11 @@ body{background:#0b0e14;color:#adbac7;font-family:system-ui}
         <input type="text" id="login" class="form-control" value="476924559">
       </div>
       <div class="mb-3">
-        <label class="form-label">Password (Main trading password)</label>
+        <label class="form-label">Password (Main password, not Investor)</label>
         <input type="password" id="password" class="form-control">
       </div>
       <div class="mb-3">
-        <label class="form-label">Server name (exact)</label>
+        <label class="form-label">Server (exact name)</label>
         <input type="text" id="server" class="form-control" value="Exness-MT5Trial9">
       </div>
       <div class="mb-3">
@@ -355,26 +359,26 @@ body{background:#0b0e14;color:#adbac7;font-family:system-ui}
       </div>
     </div>
 
-    <div id="errorBox" class="error-box mb-3"></div>
+    <div id="errorBox" class="error-box"></div>
     <button id="btnConnect" onclick="doConnect()" class="btn btn-success w-100 py-2">Connect to Broker</button>
   </div>
 </div>
 
-<!-- STRATEGY TAB -->
+<!-- STRATEGY -->
 <div id="tab-strategy" class="tab-pane" style="display:none">
   <div class="card p-3">
     <div class="row g-3">
       <div class="col-md-6">
-        <label class="form-label">Symbol (Weekend friendly)</label>
+        <label class="form-label">Symbol (works on weekend)</label>
         <select id="symbol" class="form-select">
           <optgroup label="Crypto 24/7">
-            <option value="BTCUSD">BTCUSD</option>
+            <option value="BTCUSD" selected>BTCUSD</option>
             <option value="ETHUSD">ETHUSD</option>
             <option value="SOLUSD">SOLUSD</option>
             <option value="XRPUSD">XRPUSD</option>
             <option value="DOGEUSD">DOGEUSD</option>
           </optgroup>
-          <optgroup label="Forex / Metal">
+          <optgroup label="Forex / Metals">
             <option value="EURUSD">EURUSD</option>
             <option value="GBPUSD">GBPUSD</option>
             <option value="XAUUSD">XAUUSD</option>
@@ -398,7 +402,7 @@ body{background:#0b0e14;color:#adbac7;font-family:system-ui}
         <input type="number" id="lot" class="form-control" value="0.01" step="0.01">
       </div>
       <div class="col-6">
-        <label class="form-label">Max Trades</label>
+        <label class="form-label">Max Open Trades</label>
         <input type="number" id="maxTrades" class="form-control" value="1">
       </div>
       <div class="col-6">
@@ -413,7 +417,7 @@ body{background:#0b0e14;color:#adbac7;font-family:system-ui}
   </div>
 </div>
 
-<!-- LIVE TAB -->
+<!-- LIVE -->
 <div id="tab-live" class="tab-pane" style="display:none">
   <div class="card p-3 text-center">
     <div class="row mb-3">
@@ -426,7 +430,7 @@ body{background:#0b0e14;color:#adbac7;font-family:system-ui}
         <h3 id="eq" class="text-warning">$0.00</h3>
       </div>
     </div>
-    <div class="mb-3">Signal: <span id="signal">NONE</span></div>
+    <div class="mb-3">Last Signal: <strong id="signal">NONE</strong></div>
     <div class="d-flex gap-2">
       <button id="btnStart" onclick="startBot()" class="btn btn-success w-50" disabled>▶ RUN BOT</button>
       <button id="btnStop" onclick="stopBot()" class="btn btn-danger w-50" disabled>⏹ STOP</button>
@@ -443,65 +447,76 @@ body{background:#0b0e14;color:#adbac7;font-family:system-ui}
 <script>
 function toggleMethod(){
   const m = document.getElementById('method').value;
-  document.getElementById('box-account-id').style.display = m==='account_id'?'block':'none';
-  document.getElementById('box-credentials').style.display = m==='credentials'?'block':'none';
+  document.getElementById('box-account-id').style.display = m === 'account_id' ? 'block' : 'none';
+  document.getElementById('box-credentials').style.display = m === 'credentials' ? 'block' : 'none';
 }
 document.querySelectorAll('[data-tab]').forEach(btn=>{
-  btn.onclick = ()=>{
-    document.querySelectorAll('.nav-link').forEach(b=>b.classList.remove('active'));
+  btn.onclick = () => {
+    document.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    document.querySelectorAll('.tab-pane').forEach(p=>p.style.display='none');
-    document.getElementById('tab-'+btn.dataset.tab).style.display='block';
+    document.querySelectorAll('.tab-pane').forEach(p => p.style.display = 'none');
+    document.getElementById('tab-' + btn.dataset.tab).style.display = 'block';
   }
 });
 
 async function refresh(){
-  const r = await fetch('/api/status');
-  const d = await r.json();
-  document.getElementById('statusBadge').textContent = '● ' + d.status_msg;
-  document.getElementById('statusBadge').className = d.is_connected ? 'status-online' : 'status-offline';
-  document.getElementById('bal').textContent = '$' + d.balance.toFixed(2);
-  document.getElementById('eq').textContent = '$' + d.equity.toFixed(2);
-  document.getElementById('signal').textContent = d.last_signal;
-  document.getElementById('logs').innerHTML = d.logs.join('<br>');
-  document.getElementById('logs').scrollTop = 99999;
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    document.getElementById('statusBadge').textContent = '● ' + d.status_msg;
+    document.getElementById('statusBadge').className = d.is_connected ? 'status-online' : 'status-offline';
+    document.getElementById('bal').textContent = '$' + d.balance.toFixed(2);
+    document.getElementById('eq').textContent = '$' + d.equity.toFixed(2);
+    document.getElementById('signal').textContent = d.last_signal;
+    document.getElementById('logs').innerHTML = d.logs.join('<br>');
+    document.getElementById('logs').scrollTop = 99999;
 
-  const err = document.getElementById('errorBox');
-  if(d.last_error){
-    err.style.display = 'block';
-    err.textContent = 'Error: ' + d.last_error;
-  }else{
-    err.style.display = 'none';
-  }
+    const err = document.getElementById('errorBox');
+    if(d.last_error){
+      err.style.display = 'block';
+      err.textContent = 'Error: ' + d.last_error;
+    } else {
+      err.style.display = 'none';
+    }
 
-  document.getElementById('btnStart').disabled = !d.is_connected || d.is_running;
-  document.getElementById('btnStop').disabled = !d.is_running;
+    document.getElementById('btnStart').disabled = !d.is_connected || d.is_running;
+    document.getElementById('btnStop').disabled = !d.is_running;
+  } catch(e){}
 }
 setInterval(refresh, 2500);
 
 async function doConnect(){
   const btn = document.getElementById('btnConnect');
-  btn.disabled = true; btn.textContent = 'Connecting... please wait';
+  btn.disabled = true;
+  btn.textContent = 'Connecting... please wait';
+
   const method = document.getElementById('method').value;
-  let body = { token: document.getElementById('token').value, method };
+  let body = { token: document.getElementById('token').value.trim(), method };
+
   if(method === 'account_id'){
     body.account_id = document.getElementById('accountId').value.trim();
-  }else{
+  } else {
     body.login = document.getElementById('login').value.trim();
     body.password = document.getElementById('password').value;
     body.server = document.getElementById('server').value.trim();
     body.platform = document.getElementById('platform').value;
     body.region = document.getElementById('region').value;
   }
+
   const r = await fetch('/api/connect', {
-    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
   });
   const d = await r.json();
-  btn.disabled = false; btn.textContent = 'Connect to Broker';
+
+  btn.disabled = false;
+  btn.textContent = 'Connect to Broker';
+
   if(d.success){
     alert('✅ Connected successfully!');
     document.querySelector('[data-tab="strategy"]').click();
-  }else{
+  } else {
     alert('❌ Failed: ' + d.message);
   }
 }
@@ -515,10 +530,14 @@ async function startBot(){
     stop_loss_pips: parseInt(document.getElementById('sl').value),
     take_profit_pips: parseInt(document.getElementById('tp').value)
   };
-  await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  await fetch('/api/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
 }
 async function stopBot(){
-  await fetch('/api/stop', {method:'POST'});
+  await fetch('/api/stop', {method: 'POST'});
 }
 </script>
 </body>
@@ -535,7 +554,7 @@ def status():
 
 @app.route("/api/connect", methods=["POST"])
 def api_connect():
-    data = request.json
+    data = request.json or {}
     token = data.get("token", "").strip()
     if not token:
         return jsonify(success=False, message="MetaApi token is required")
@@ -562,19 +581,19 @@ def api_connect():
 
     future = asyncio.run_coroutine_threadsafe(_do(), bg_loop)
     try:
-        ok, msg = future.result(timeout=90)
+        ok, msg = future.result(timeout=120)
         return jsonify(success=ok, message=msg)
     except Exception as e:
         bot_state["last_error"] = str(e)
         bot_state["status_msg"] = "Connection Failed"
-        add_log(f"Fatal: {e}")
+        add_log(f"Fatal error: {e}")
         return jsonify(success=False, message=str(e))
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
     if not bot_state["is_connected"]:
         return jsonify(status="not_connected")
-    data = request.json
+    data = request.json or {}
     bot_state.update({
         "symbol": data.get("symbol", "BTCUSD").upper(),
         "timeframe": data.get("timeframe", "15m"),
@@ -590,8 +609,9 @@ def api_start():
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
     bot_state["is_running"] = False
-    add_log("Stop requested")
+    add_log("Stop requested by user")
     return jsonify(status="stopped")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
