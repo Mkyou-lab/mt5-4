@@ -1,6 +1,9 @@
 """
-Cloud Trading Bot for Railway + MetaAPI (MT4/MT5)
-Fixed: 'no running event loop' under Gunicorn
+🤖 CLOUD TRADING BOT for Railway
+- Works with MT4 & MT5 via MetaAPI Cloud
+- Trades Crypto (24/7 - weekends included), Forex, Metals, Indices
+- Mobile-friendly web dashboard
+- Auto risk management and trailing stop
 """
 
 import os
@@ -10,7 +13,7 @@ import threading
 import logging
 import traceback
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -24,7 +27,7 @@ app = Flask(__name__)
 CORS(app)
 
 # ============================================================
-#  DEDICATED ASYNCIO LOOP (fixes "no running event loop")
+# DEDICATED ASYNCIO LOOP (required for MetaAPI + Gunicorn)
 # ============================================================
 _loop: Optional[asyncio.AbstractEventLoop] = None
 _loop_thread: Optional[threading.Thread] = None
@@ -32,40 +35,98 @@ _loop_ready = threading.Event()
 
 
 def _start_background_loop():
-    """Start one permanent event loop in a background thread."""
     global _loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _loop = loop
     _loop_ready.set()
-    logger.info("Asyncio event loop started")
+    logger.info("Background asyncio loop started")
     loop.run_forever()
 
 
 def ensure_loop():
-    """Make sure the background loop is running."""
     global _loop_thread
     if _loop_thread is None or not _loop_thread.is_alive():
         _loop_ready.clear()
         _loop_thread = threading.Thread(target=_start_background_loop, daemon=True)
         _loop_thread.start()
         if not _loop_ready.wait(timeout=10):
-            raise RuntimeError("Failed to start asyncio event loop")
+            raise RuntimeError("Failed to start asyncio loop")
     return _loop
 
 
 def run_async(coro, timeout=300):
-    """
-    Run a coroutine on the background loop from any thread.
-    This is the key fix for MetaAPI + Gunicorn.
-    """
     loop = ensure_loop()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=timeout)
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    return fut.result(timeout=timeout)
 
 
 # ============================================================
-#  GLOBAL STATE
+# SYMBOL HELPERS (pip size + lot sizing for crypto/forex/metals)
+# ============================================================
+def get_pip_size(symbol: str) -> float:
+    s = symbol.upper()
+    # Big-price crypto (BTC/ETH) — 1 unit = 1 pip
+    if any(x in s for x in ("BTC", "ETH", "BNB", "SOL")):
+        return 1.0
+    # Small-price crypto
+    if any(x in s for x in ("XRP", "ADA", "DOGE", "MATIC", "DOT", "LINK",
+                             "AVAX", "ATOM", "UNI", "APT", "LTC")):
+        return 0.001
+    # Metals
+    if "XAU" in s:  # Gold
+        return 0.1
+    if "XAG" in s:  # Silver
+        return 0.001
+    # Indices / Oil
+    if any(x in s for x in ("US500", "US30", "NAS100", "GER40",
+                             "UK100", "USOIL", "UKOIL")):
+        return 0.1
+    # JPY forex
+    if "JPY" in s:
+        return 0.01
+    # Standard FX
+    return 0.0001
+
+
+def estimate_lots(symbol: str, balance: float, risk_pct: float, sl_pips: float) -> float:
+    """Rough position sizing - broker specifics vary."""
+    risk_amount = balance * (risk_pct / 100.0)
+    s = symbol.upper()
+
+    if sl_pips <= 0:
+        sl_pips = 50
+
+    # Crypto - use very small volumes
+    if "BTC" in s:
+        return max(0.01, min(round(risk_amount / max(sl_pips * 1.0, 1), 2), 0.10))
+    if "ETH" in s:
+        return max(0.01, min(round(risk_amount / max(sl_pips * 1.0, 1), 2), 0.50))
+    if any(x in s for x in ("BNB", "SOL", "LTC")):
+        return max(0.01, min(round(risk_amount / max(sl_pips * 1.0, 1), 2), 1.0))
+    if any(x in s for x in ("XRP", "ADA", "DOGE", "MATIC", "DOT",
+                             "LINK", "AVAX", "ATOM", "UNI", "APT")):
+        return max(0.01, min(round(risk_amount / max(sl_pips * 0.1, 1), 2), 5.0))
+
+    # Metals
+    if "XAU" in s:
+        return max(0.01, min(round(risk_amount / max(sl_pips * 1.0, 1), 2), 0.50))
+    if "XAG" in s:
+        return max(0.01, min(round(risk_amount / max(sl_pips * 0.5, 1), 2), 1.0))
+
+    # Indices / Oil
+    if any(x in s for x in ("US500", "US30", "NAS100", "GER40",
+                             "UK100", "USOIL", "UKOIL")):
+        return max(0.01, min(round(risk_amount / max(sl_pips * 1.0, 1), 2), 1.0))
+
+    # Forex
+    pip_value = 9.0 if "JPY" in s else 10.0
+    lots = risk_amount / max(sl_pips * pip_value, 1)
+    return max(0.01, min(round(lots, 2), 2.0))
+
+
+# ============================================================
+# GLOBAL STATE
 # ============================================================
 bot_state = {
     "connected": False,
@@ -75,14 +136,14 @@ bot_state = {
     "connection_error": None,
     "running": False,
     "config": {
-        "symbols": ["EURUSD", "GBPUSD", "USDJPY"],
-        "timeframe": "1h",
+        "symbols": ["BTCUSD", "ETHUSD", "XRPUSD"],
+        "timeframe": "15m",
         "max_trades": 3,
         "risk_percent": 1.0,
         "max_daily_loss_percent": 5.0,
-        "stop_loss_pips": 50,
-        "take_profit_pips": 100,
-        "trailing_stop_pips": 20,
+        "stop_loss_pips": 200,
+        "take_profit_pips": 400,
+        "trailing_stop_pips": 100,
         "min_signal_strength": 65,
     },
     "positions": [],
@@ -101,24 +162,22 @@ state_lock = threading.Lock()
 
 meta_api = None
 mt_account = None
-connection = None  # MetaAPI RPC connection
+connection = None
 trading_thread = None
 start_time = None
 
 
 # ============================================================
-#  CONNECT TO MT4/MT5 VIA METAAPI
+# METAAPI CONNECTION
 # ============================================================
-async def _async_connect(token: str, login: str, password: str, server: str, platform: str):
+async def _async_connect(token, login, password, server, platform):
     global meta_api, mt_account, connection
-
     from metaapi_cloud_sdk import MetaApi
 
     api = MetaApi(token.strip())
     meta_api = api
 
-    account_api = api.metatrader_account_api
-    accounts = await account_api.get_accounts_with_infinite_scroll_pagination()
+    accounts = await api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination()
 
     existing = None
     for acc in accounts:
@@ -131,40 +190,33 @@ async def _async_connect(token: str, login: str, password: str, server: str, pla
 
     if existing:
         account = existing
-        logger.info(f"Reusing existing MetaAPI account: {account.id}")
-        # Update password if needed
+        logger.info(f"Found existing account: {account.id}")
         try:
-            await account.update({
-                "password": password.strip(),
-                "server": server.strip(),
-            })
+            await account.update({"password": password.strip(), "server": server.strip()})
         except Exception as e:
-            logger.warning(f"Account update skipped: {e}")
+            logger.warning(f"Update skipped: {e}")
     else:
         logger.info("Creating new MetaAPI cloud account...")
-        account = await account_api.create_account({
+        account = await api.metatrader_account_api.create_account({
             "name": f"Bot-{login}",
             "type": "cloud",
             "login": str(login).strip(),
             "password": str(password).strip(),
             "server": str(server).strip(),
-            "platform": platform.strip().lower(),  # mt4 or mt5
+            "platform": platform.strip().lower(),
             "magic": 123456,
             "quoteStreamingIntervalInSeconds": 2.5,
             "reliability": "regular",
         })
 
-    # Deploy
-    state = getattr(account, "state", None)
-    logger.info(f"Account state: {state}")
-    if state in ("UNDEPLOYED", "DEPLOY_FAILED", None) or str(state) == "UNDEPLOYED":
-        logger.info("Deploying account (can take 1–3 minutes)...")
+    state = str(getattr(account, "state", "")).upper()
+    if state in ("UNDEPLOYED", "DEPLOY_FAILED", ""):
+        logger.info("Deploying account (1-3 min)...")
         await account.deploy()
 
-    logger.info("Waiting until connected to broker...")
+    logger.info("Waiting for broker connection...")
     await account.wait_connected()
 
-    # RPC connection
     conn = account.get_rpc_connection()
     await conn.connect()
     await conn.wait_synchronized()
@@ -194,10 +246,7 @@ def connect_to_mt(token, login, password, server, platform):
 
     try:
         ensure_loop()
-        info = run_async(
-            _async_connect(token, login, password, server, platform),
-            timeout=360,
-        )
+        info = run_async(_async_connect(token, login, password, server, platform), timeout=360)
         with state_lock:
             bot_state["connected"] = True
             bot_state["connecting"] = False
@@ -206,8 +255,8 @@ def connect_to_mt(token, login, password, server, platform):
             bot_state["balance"] = info["balance"]
             bot_state["equity"] = info["equity"]
             bot_state["connection_error"] = None
-        logger.info(f"Connected OK — balance {info['balance']}")
-        return {"success": True, "account_info": info}
+        logger.info(f"Connected. Balance: {info['balance']}")
+        return {"success": True}
     except Exception as e:
         err = str(e)
         logger.error(f"Connect failed: {err}\n{traceback.format_exc()}")
@@ -220,7 +269,7 @@ def connect_to_mt(token, login, password, server, platform):
 
 
 # ============================================================
-#  INDICATORS + STRATEGY
+# TECHNICAL INDICATORS
 # ============================================================
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) < 50:
@@ -303,10 +352,10 @@ def analyze_market(df: pd.DataFrame, symbol: str, config: dict) -> Optional[dict
 
     if last["Stoch_K"] < 20 and last["Stoch_K"] > last["Stoch_D"]:
         score += 0.15
-        reasons.append("Stoch oversold turn up")
+        reasons.append("Stoch oversold turn-up")
     elif last["Stoch_K"] > 80 and last["Stoch_K"] < last["Stoch_D"]:
         score -= 0.15
-        reasons.append("Stoch overbought turn down")
+        reasons.append("Stoch overbought turn-down")
 
     strength = min(abs(score), 1.0)
     if strength < config.get("min_signal_strength", 65) / 100.0:
@@ -314,18 +363,16 @@ def analyze_market(df: pd.DataFrame, symbol: str, config: dict) -> Optional[dict
 
     direction = "buy" if score > 0 else "sell"
     price = float(last["Close"])
-    pip = 0.01 if "JPY" in symbol else (0.01 if symbol.startswith("XAU") else 0.0001)
-    # Gold often uses 0.1 pip scale depending on broker — keep simple
-    if "XAU" in symbol:
-        pip = 0.1
-
+    pip = get_pip_size(symbol)
     sl_dist = config.get("stop_loss_pips", 50) * pip
     tp_dist = config.get("take_profit_pips", 100) * pip
 
     if direction == "buy":
-        sl, tp = round(price - sl_dist, 5), round(price + tp_dist, 5)
+        sl = round(price - sl_dist, 5)
+        tp = round(price + tp_dist, 5)
     else:
-        sl, tp = round(price + sl_dist, 5), round(price - tp_dist, 5)
+        sl = round(price + sl_dist, 5)
+        tp = round(price - tp_dist, 5)
 
     return {
         "symbol": symbol,
@@ -340,27 +387,22 @@ def analyze_market(df: pd.DataFrame, symbol: str, config: dict) -> Optional[dict
 
 
 # ============================================================
-#  METAAPI HELPERS (async)
+# METAAPI HELPERS
 # ============================================================
-async def _get_candles(symbol: str, timeframe: str, count: int = 250):
-    """Fetch candles — MetaAPI method names vary by SDK version."""
-    # Preferred: get_historical_candles
+async def _get_candles(symbol, timeframe, count=250):
     try:
         candles = await connection.get_historical_candles(symbol, timeframe, None, count)
         if candles:
             return candles
     except Exception as e:
         logger.debug(f"get_historical_candles: {e}")
-
     try:
         candles = await connection.get_candles(symbol, timeframe, count)
         if candles:
             return candles
     except Exception as e:
         logger.debug(f"get_candles: {e}")
-
-    # Fallback: rates via market data
-    raise RuntimeError(f"Could not fetch candles for {symbol}")
+    raise RuntimeError(f"No candle data for {symbol}")
 
 
 def candles_to_df(candles) -> Optional[pd.DataFrame]:
@@ -370,11 +412,11 @@ def candles_to_df(candles) -> Optional[pd.DataFrame]:
     for c in candles:
         if isinstance(c, dict):
             rows.append({
-                "Open": float(c.get("open", c.get("Open", 0))),
-                "High": float(c.get("high", c.get("High", 0))),
-                "Low": float(c.get("low", c.get("Low", 0))),
-                "Close": float(c.get("close", c.get("Close", 0))),
-                "Volume": float(c.get("tickVolume", c.get("volume", c.get("Volume", 1)))),
+                "Open": float(c.get("open", c.get("Open", 0)) or 0),
+                "High": float(c.get("high", c.get("High", 0)) or 0),
+                "Low": float(c.get("low", c.get("Low", 0)) or 0),
+                "Close": float(c.get("close", c.get("Close", 0)) or 0),
+                "Volume": float(c.get("tickVolume", c.get("volume", c.get("Volume", 1))) or 1),
             })
     if not rows:
         return None
@@ -389,7 +431,7 @@ async def _place_order(direction, symbol, lots, sl, tp):
 
 
 # ============================================================
-#  TRADING WORKER
+# TRADING WORKER
 # ============================================================
 def trading_bot_worker():
     global start_time
@@ -412,31 +454,24 @@ def trading_bot_worker():
                 cycle = bot_state["cycle_count"]
             logger.info(f"Cycle #{cycle}")
 
-            # Account info
             try:
                 info = run_async(connection.get_account_information(), timeout=60)
                 with state_lock:
                     bot_state["balance"] = float(info.get("balance", 0) or 0)
                     bot_state["equity"] = float(info.get("equity", 0) or 0)
             except Exception as e:
-                logger.warning(f"Account refresh: {e}")
+                logger.warning(f"Account refresh error: {e}")
 
-            # Positions
             try:
                 raw = run_async(connection.get_positions(), timeout=60) or []
             except Exception as e:
-                logger.warning(f"Positions: {e}")
+                logger.warning(f"Position fetch error: {e}")
                 raw = []
 
             positions, unrealized = [], 0.0
             for p in raw:
                 typ = str(p.get("type", "")).lower()
-                if "buy" in typ:
-                    side = "buy"
-                elif "sell" in typ:
-                    side = "sell"
-                else:
-                    side = typ
+                side = "buy" if "buy" in typ else "sell" if "sell" in typ else typ
                 pos = {
                     "id": p.get("id"),
                     "symbol": p.get("symbol"),
@@ -457,11 +492,10 @@ def trading_bot_worker():
                 bot_state["unrealized_pnl"] = round(unrealized, 2)
                 balance = bot_state["balance"]
 
-            # Daily loss guard
             max_loss = balance * (config.get("max_daily_loss_percent", 5) / 100.0)
             if max_loss > 0 and unrealized < -max_loss:
                 with state_lock:
-                    bot_state["error_message"] = f"Max daily loss hit (${unrealized:.2f})"
+                    bot_state["error_message"] = f"Daily loss limit hit (${unrealized:.2f})"
                 time.sleep(30)
                 continue
 
@@ -475,10 +509,11 @@ def trading_bot_worker():
                     continue
 
                 try:
-                    tf = config.get("timeframe", "1h")
+                    tf = config.get("timeframe", "15m")
                     candles = run_async(_get_candles(sym, tf, 250), timeout=90)
                     df = candles_to_df(candles)
                     if df is None or len(df) < 50:
+                        logger.info(f"{sym}: insufficient data")
                         continue
 
                     sig = analyze_market(df, sym, config)
@@ -494,18 +529,17 @@ def trading_bot_worker():
                         })
                         bot_state["signals_log"] = bot_state["signals_log"][:40]
 
-                    risk_pct = float(config.get("risk_percent", 1.0)) / 100.0
-                    risk_amount = balance * risk_pct
-                    sl_pips = float(config.get("stop_loss_pips", 50))
-                    pip_value = 10.0  # approx $ per pip per lot
-                    lots = risk_amount / (sl_pips * pip_value) if sl_pips * pip_value > 0 else 0.01
-                    lots = max(0.01, min(round(lots, 2), 2.0))
+                    lots = estimate_lots(
+                        sym, balance,
+                        float(config.get("risk_percent", 1.0)),
+                        float(config.get("stop_loss_pips", 50)),
+                    )
 
                     result = run_async(
                         _place_order(sig["direction"], sym, lots, sig["sl"], sig["tp"]),
                         timeout=90,
                     )
-                    logger.info(f"Order result: {result}")
+                    logger.info(f"Order placed: {sym} {sig['direction']} {lots} lots")
 
                     with state_lock:
                         bot_state["trade_log"].insert(0, {
@@ -521,15 +555,19 @@ def trading_bot_worker():
                     active += 1
 
                 except Exception as e:
-                    logger.error(f"Symbol {sym}: {e}")
+                    logger.error(f"Trade error {sym}: {e}")
+                    with state_lock:
+                        bot_state["signals_log"].insert(0, {
+                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "text": f"❌ {sym}: {str(e)[:60]}",
+                            "reasons": [],
+                        })
 
-            # Simple trailing stop
+            # Trailing stop
             trail = float(config.get("trailing_stop_pips", 20))
             for p in positions:
                 try:
-                    pip = 0.01 if "JPY" in (p["symbol"] or "") else 0.0001
-                    if "XAU" in (p["symbol"] or ""):
-                        pip = 0.1
+                    pip = get_pip_size(p["symbol"] or "")
                     dist = trail * pip
                     new_sl = p["sl"]
                     if p["type"] == "buy":
@@ -542,7 +580,8 @@ def trading_bot_worker():
                             new_sl = candidate
                     if new_sl != p["sl"] and new_sl > 0 and p.get("id"):
                         run_async(
-                            connection.modify_position(p["id"], stop_loss=new_sl, take_profit=p["tp"] or None),
+                            connection.modify_position(p["id"], stop_loss=new_sl,
+                                                       take_profit=p["tp"] or None),
                             timeout=60,
                         )
                 except Exception as e:
@@ -564,14 +603,14 @@ def trading_bot_worker():
 
 
 # ============================================================
-#  API ROUTES
+# API ROUTES
 # ============================================================
 @app.route("/api/connect", methods=["POST"])
 def api_connect():
     data = request.get_json(silent=True) or {}
     for f in ("metaapi_token", "login", "password", "server", "platform"):
         if not str(data.get(f, "")).strip():
-            return jsonify({"error": f"Missing: {f}"}), 400
+            return jsonify({"error": f"Missing field: {f}"}), 400
 
     if bot_state.get("connected"):
         return jsonify({"error": "Already connected. Disconnect first."}), 400
@@ -579,13 +618,11 @@ def api_connect():
         return jsonify({"status": "connecting"}), 200
 
     def job():
-        connect_to_mt(
-            data["metaapi_token"], data["login"], data["password"],
-            data["server"], data["platform"],
-        )
+        connect_to_mt(data["metaapi_token"], data["login"],
+                       data["password"], data["server"], data["platform"])
 
     threading.Thread(target=job, daemon=True).start()
-    return jsonify({"status": "connecting", "message": "Connecting… can take 1–3 minutes"})
+    return jsonify({"status": "connecting"})
 
 
 @app.route("/api/disconnect", methods=["POST"])
@@ -605,7 +642,7 @@ def api_disconnect():
 def api_start():
     global trading_thread
     if not bot_state.get("connected"):
-        return jsonify({"error": "Connect first"}), 400
+        return jsonify({"error": "Connect to broker first"}), 400
 
     data = request.get_json(silent=True) or {}
     with state_lock:
@@ -629,7 +666,6 @@ def api_start():
     if trading_thread is None or not trading_thread.is_alive():
         trading_thread = threading.Thread(target=trading_bot_worker, daemon=True)
         trading_thread.start()
-
     return jsonify({"status": "started", "config": bot_state["config"]})
 
 
@@ -661,7 +697,6 @@ def api_close_all():
 @app.route("/api/status")
 def api_status():
     with state_lock:
-        # return a plain copy safe for JSON
         return jsonify({
             "connected": bot_state["connected"],
             "connecting": bot_state["connecting"],
@@ -686,7 +721,7 @@ def api_status():
 
 
 # ============================================================
-#  UI (same dashboard)
+# DASHBOARD HTML
 # ============================================================
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
@@ -696,7 +731,7 @@ DASHBOARD_HTML = r"""
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Cloud Trading Bot</title>
 <style>
-:root{--bg:#090d16;--card:#121826;--border:#1f2b3e;--green:#00e676;--red:#ff5252;--blue:#2979ff;--yellow:#ffd740;--text:#e8ecf4;--muted:#64748b;--input-bg:#0b111e}
+:root{--bg:#090d16;--card:#121826;--border:#1f2b3e;--green:#00e676;--red:#ff5252;--blue:#2979ff;--yellow:#ffd740;--orange:#ff9800;--text:#e8ecf4;--muted:#64748b;--input-bg:#0b111e}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);padding-bottom:50px}
 .hdr{background:#0e1626;padding:14px 16px;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:50}
@@ -728,23 +763,31 @@ label{font-size:.78em;color:var(--muted);margin-bottom:4px;display:block}
 .btn-red{background:var(--red);color:#fff}
 .btn-blue{background:var(--blue);color:#fff}
 .btn-yellow{background:var(--yellow);color:#000}
+.btn-orange{background:var(--orange);color:#000}
 .btn:disabled{opacity:.4}
 .chip-wrap{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
-.chip{padding:6px 12px;border-radius:20px;font-size:.8em;font-weight:600;border:1px solid var(--border);background:var(--input-bg);color:var(--muted)}
+.chip{padding:6px 12px;border-radius:20px;font-size:.78em;font-weight:600;border:1px solid var(--border);background:var(--input-bg);color:var(--muted);cursor:pointer;user-select:none}
 .chip.active{background:var(--blue);color:#fff;border-color:var(--blue)}
+.chip-crypto.active{background:var(--orange);border-color:var(--orange);color:#000}
+.chip-preset{padding:8px 12px;border-radius:8px;font-size:.8em;font-weight:600;background:#1a2333;color:var(--text);border:1px solid var(--border);cursor:pointer;flex:1;text-align:center;user-select:none}
+.chip-preset.crypto{border-color:var(--orange);color:var(--orange)}
+.chip-preset.fx{border-color:var(--blue);color:var(--blue)}
 .tabs{display:flex;margin-bottom:12px;background:var(--card);border-radius:10px;overflow:hidden;border:1px solid var(--border)}
-.tab{flex:1;padding:12px;text-align:center;font-size:.82em;font-weight:600;color:var(--muted)}
+.tab{flex:1;padding:12px;text-align:center;font-size:.82em;font-weight:600;color:var(--muted);cursor:pointer}
 .tab.active{background:var(--blue);color:#fff}
 .pos-item{display:flex;justify-content:space-between;padding:10px 12px;background:#090d18;border-radius:8px;margin-bottom:6px;font-size:.85em}
 .pos-buy{color:var(--green);font-weight:bold}.pos-sell{color:var(--red);font-weight:bold}
 .log{max-height:180px;overflow-y:auto;font-family:monospace;font-size:.75em;line-height:1.6}
 .err{background:rgba(255,82,82,.15);border:1px solid var(--red);border-radius:8px;padding:10px;margin-bottom:10px;font-size:.85em;color:var(--red)}
 .info{background:rgba(41,121,255,.12);border:1px solid var(--blue);border-radius:8px;padding:10px;margin-bottom:10px;font-size:.8em;color:#90caf9}
+.pair-group{margin-bottom:12px}
+.pair-group-title{font-size:.7em;color:var(--orange);margin-bottom:5px;font-weight:700}
+.weekend-note{background:rgba(255,152,0,.12);border:1px solid var(--orange);border-radius:8px;padding:8px 10px;margin-bottom:10px;font-size:.75em;color:#ffb74d}
 </style>
 </head>
 <body>
 <div class="hdr"><div class="hdr-row">
-  <h1>Cloud Trading Bot</h1>
+  <h1>🤖 Cloud Trading Bot</h1>
   <div class="badge" id="statusBadge"><div class="dot" id="statusDot"></div><span id="statusText">Offline</span></div>
 </div></div>
 <div class="wrap">
@@ -769,7 +812,7 @@ label{font-size:.78em;color:var(--muted);margin-bottom:4px;display:block}
       <label>Account Login</label>
       <input type="text" id="login" placeholder="Account number" inputmode="numeric">
       <label>Password</label>
-      <input type="password" id="password" placeholder="Investor or trading password">
+      <input type="password" id="password" placeholder="Main trading password (not investor)">
       <label>Server</label>
       <input type="text" id="server" placeholder="e.g. Exness-MT5Trial9">
       <button class="btn btn-blue" id="btnConn" onclick="connect()">Connect to Broker</button>
@@ -778,30 +821,56 @@ label{font-size:.78em;color:var(--muted);margin-bottom:4px;display:block}
   </div>
 
   <div id="sec-config" style="display:none">
-    <div class="card"><div class="card-t">Pairs</div><div class="chip-wrap" id="pairs"></div></div>
+    <div class="weekend-note">
+      🌙 <b>Weekend Trading:</b> Only crypto (BTC/ETH/etc.) runs 24/7.
+      Forex is closed Sat/Sun. Use "Weekend Crypto" preset below.
+    </div>
+
+    <div class="card">
+      <div class="card-t">Quick Preset</div>
+      <div class="chip-wrap">
+        <div class="chip-preset crypto" onclick="pickWeekend()">🌙 Weekend Crypto</div>
+        <div class="chip-preset fx" onclick="pickForex()">💱 Forex Weekday</div>
+      </div>
+      <div class="chip-wrap">
+        <div class="chip-preset" onclick="pickAll()">All</div>
+        <div class="chip-preset" onclick="pickNone()">Clear</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Trading Pairs</div>
+      <div id="pairGroups"></div>
+    </div>
+
     <div class="card">
       <div class="card-t">Settings</div>
       <label>Timeframe</label>
       <select id="tf">
-        <option value="15m">M15</option><option value="30m">M30</option>
-        <option value="1h" selected>H1</option><option value="4h">H4</option>
+        <option value="5m">M5 (5 min)</option>
+        <option value="15m" selected>M15 (15 min)</option>
+        <option value="30m">M30 (30 min)</option>
+        <option value="1h">H1 (1 hour)</option>
+        <option value="4h">H4 (4 hours)</option>
+        <option value="1d">D1 (Daily)</option>
       </select>
       <div class="grid2">
         <div><label>Max Trades</label><input type="number" id="maxTrades" value="3"></div>
         <div><label>Risk %</label><input type="number" id="riskPct" value="1" step="0.1"></div>
       </div>
       <div class="grid3">
-        <div><label>SL pips</label><input type="number" id="slPips" value="50"></div>
-        <div><label>TP pips</label><input type="number" id="tpPips" value="100"></div>
-        <div><label>Trail</label><input type="number" id="trailPips" value="20"></div>
+        <div><label>SL pips</label><input type="number" id="slPips" value="200"></div>
+        <div><label>TP pips</label><input type="number" id="tpPips" value="400"></div>
+        <div><label>Trail pips</label><input type="number" id="trailPips" value="100"></div>
       </div>
       <div class="grid2">
-        <div><label>Min signal %</label><input type="number" id="minStr" value="65"></div>
-        <div><label>Max daily loss %</label><input type="number" id="maxLoss" value="5" step="0.5"></div>
+        <div><label>Min Signal %</label><input type="number" id="minStr" value="65"></div>
+        <div><label>Max Daily Loss %</label><input type="number" id="maxLoss" value="5" step="0.5"></div>
       </div>
     </div>
-    <button class="btn btn-green" id="btnRun" onclick="startBot()" disabled>Start Automated Trading</button>
-    <button class="btn btn-red" id="btnStop" onclick="stopBot()" style="margin-top:8px;display:none">Stop Bot</button>
+
+    <button class="btn btn-green" id="btnRun" onclick="startBot()" disabled>▶ Start Automated Trading</button>
+    <button class="btn btn-red" id="btnStop" onclick="stopBot()" style="margin-top:8px;display:none">⏹ Stop Bot</button>
   </div>
 
   <div id="sec-live" style="display:none">
@@ -814,58 +883,207 @@ label{font-size:.78em;color:var(--muted);margin-bottom:4px;display:block}
     <div class="card">
       <div class="card-t">Positions (<span id="posCount">0</span>)</div>
       <div id="posList" style="color:var(--muted);text-align:center;padding:10px">None</div>
-      <button class="btn btn-yellow" style="margin-top:8px" onclick="closeAll()">Close All</button>
+      <button class="btn btn-yellow" style="margin-top:8px" onclick="closeAll()">Close All Positions</button>
     </div>
     <div class="card"><div class="card-t">Signals</div><div class="log" id="sigLog">Waiting...</div></div>
+    <div class="card"><div class="card-t">Trades</div><div class="log" id="tradeLog">No trades yet</div></div>
   </div>
 </div>
+
 <script>
-const PAIRS=['EURUSD','GBPUSD','USDJPY','AUDUSD','USDCAD','NZDUSD','EURJPY','GBPJPY','XAUUSD'];
-let selPairs=['EURUSD','GBPUSD','USDJPY'];
-function initPairs(){document.getElementById('pairs').innerHTML=PAIRS.map(p=>`<div class="chip ${selPairs.includes(p)?'active':''}" onclick="togglePair('${p}',this)">${p}</div>`).join('')}
-function togglePair(p,el){if(selPairs.includes(p)){selPairs=selPairs.filter(x=>x!==p);el.classList.remove('active')}else{selPairs.push(p);el.classList.add('active')}}
+// Pair categories
+const PAIR_GROUPS = {
+  '🌙 Crypto (24/7 - Weekends OK)': [
+    'BTCUSD','ETHUSD','LTCUSD','XRPUSD','BNBUSD',
+    'ADAUSD','DOGEUSD','SOLUSD','DOTUSD','AVAXUSD',
+    'LINKUSD','MATICUSD','ATOMUSD','UNIUSD','APTUSD'
+  ],
+  '💱 Forex Majors (Mon-Fri)': [
+    'EURUSD','GBPUSD','USDJPY','AUDUSD','USDCAD','NZDUSD','USDCHF'
+  ],
+  '💱 Forex Crosses (Mon-Fri)': [
+    'EURGBP','EURJPY','GBPJPY','AUDJPY','CADJPY','CHFJPY',
+    'EURAUD','GBPAUD','EURCAD','GBPCAD'
+  ],
+  '🥇 Metals (Mon-Fri)': ['XAUUSD','XAGUSD'],
+  '📈 Indices (Mon-Fri sessions)': [
+    'US500','US30','NAS100','GER40','UK100'
+  ],
+  '🛢️ Energy (Mon-Fri)': ['USOIL','UKOIL']
+};
+
+const CRYPTO_PAIRS = PAIR_GROUPS['🌙 Crypto (24/7 - Weekends OK)'];
+const ALL_PAIRS = Object.values(PAIR_GROUPS).flat();
+
+let selPairs = ['BTCUSD','ETHUSD','XRPUSD'];
+
+function initPairs(){
+  const container = document.getElementById('pairGroups');
+  container.innerHTML = Object.entries(PAIR_GROUPS).map(([group, pairs]) => `
+    <div class="pair-group">
+      <div class="pair-group-title">${group}</div>
+      <div class="chip-wrap">
+        ${pairs.map(p => {
+          const isCrypto = CRYPTO_PAIRS.includes(p);
+          const cls = 'chip ' + (isCrypto ? 'chip-crypto ' : '') + (selPairs.includes(p) ? 'active' : '');
+          return `<div class="${cls}" onclick="togglePair('${p}',this)">${p}</div>`;
+        }).join('')}
+      </div>
+    </div>
+  `).join('');
+}
+
+function togglePair(p, el){
+  if(selPairs.includes(p)){
+    selPairs = selPairs.filter(x => x !== p);
+    el.classList.remove('active');
+  } else {
+    selPairs.push(p);
+    el.classList.add('active');
+  }
+}
+
+function pickWeekend(){
+  selPairs = ['BTCUSD','ETHUSD','XRPUSD','DOGEUSD','SOLUSD','BNBUSD','LTCUSD'];
+  document.getElementById('slPips').value = 200;
+  document.getElementById('tpPips').value = 400;
+  document.getElementById('trailPips').value = 100;
+  document.getElementById('riskPct').value = 0.5;
+  document.getElementById('maxTrades').value = 3;
+  document.getElementById('tf').value = '15m';
+  initPairs();
+}
+
+function pickForex(){
+  selPairs = ['EURUSD','GBPUSD','USDJPY','AUDUSD','USDCAD','XAUUSD'];
+  document.getElementById('slPips').value = 50;
+  document.getElementById('tpPips').value = 100;
+  document.getElementById('trailPips').value = 20;
+  document.getElementById('riskPct').value = 1;
+  document.getElementById('maxTrades').value = 3;
+  document.getElementById('tf').value = '1h';
+  initPairs();
+}
+
+function pickAll(){ selPairs = [...ALL_PAIRS]; initPairs(); }
+function pickNone(){ selPairs = []; initPairs(); }
+
 initPairs();
-function setTab(t){['connect','config','live'].forEach(x=>{document.getElementById('sec-'+x).style.display=x===t?'block':'none'});document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('active',['connect','config','live'][i]===t))}
+
+function setTab(t){
+  ['connect','config','live'].forEach(x => {
+    document.getElementById('sec-'+x).style.display = x === t ? 'block' : 'none';
+  });
+  document.querySelectorAll('.tab').forEach((el, i) => {
+    el.classList.toggle('active', ['connect','config','live'][i] === t);
+  });
+}
+
 async function connect(){
-  const body={metaapi_token:token.value.trim(),login:login.value.trim(),password:password.value.trim(),server:server.value.trim(),platform:platform.value};
-  if(!body.metaapi_token||!body.login||!body.password||!body.server){alert('Fill all fields');return}
-  btnConn.disabled=true;btnConn.textContent='Connecting (1–3 min)...';
-  infoBanner.style.display='block';infoBanner.textContent='Connecting to broker via MetaAPI. First deploy can take 1–3 minutes. Keep this page open.';
-  await fetch('/api/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const body = {
+    metaapi_token: token.value.trim(),
+    login: login.value.trim(),
+    password: password.value.trim(),
+    server: server.value.trim(),
+    platform: platform.value
+  };
+  if(!body.metaapi_token || !body.login || !body.password || !body.server){
+    alert('Fill all fields');
+    return;
+  }
+  btnConn.disabled = true;
+  btnConn.textContent = 'Connecting (1-3 min)...';
+  infoBanner.style.display = 'block';
+  infoBanner.textContent = 'Connecting via MetaAPI. First deploy takes 1-3 minutes.';
+  await fetch('/api/connect', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
 }
-async function disconnect(){await fetch('/api/disconnect',{method:'POST'})}
+
+async function disconnect(){ await fetch('/api/disconnect', {method:'POST'}); }
+
 async function startBot(){
-  const cfg={symbols:selPairs,timeframe:tf.value,max_trades:+maxTrades.value,risk_percent:+riskPct.value,stop_loss_pips:+slPips.value,take_profit_pips:+tpPips.value,trailing_stop_pips:+trailPips.value,min_signal_strength:+minStr.value,max_daily_loss_percent:+maxLoss.value};
-  const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
-  const d=await r.json();if(d.error)alert(d.error);else setTab('live');
+  if(selPairs.length === 0){ alert('Select at least one pair'); return; }
+  const cfg = {
+    symbols: selPairs,
+    timeframe: tf.value,
+    max_trades: +maxTrades.value,
+    risk_percent: +riskPct.value,
+    stop_loss_pips: +slPips.value,
+    take_profit_pips: +tpPips.value,
+    trailing_stop_pips: +trailPips.value,
+    min_signal_strength: +minStr.value,
+    max_daily_loss_percent: +maxLoss.value
+  };
+  const r = await fetch('/api/start', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(cfg)
+  });
+  const d = await r.json();
+  if(d.error) alert(d.error);
+  else setTab('live');
 }
-async function stopBot(){await fetch('/api/stop',{method:'POST'})}
-async function closeAll(){if(confirm('Close all positions?'))await fetch('/api/close_all',{method:'POST'})}
+
+async function stopBot(){ await fetch('/api/stop', {method:'POST'}); }
+async function closeAll(){
+  if(confirm('Close all positions?')) await fetch('/api/close_all', {method:'POST'});
+}
+
 async function update(){
-  try{
-    const d=await(await fetch('/api/status')).json();
-    const badge=statusBadge,dot=statusDot,txt=statusText;
-    if(d.connecting){badge.className='badge badge-wait';dot.className='dot dot-y';txt.textContent='Connecting'}
-    else if(d.connected&&d.running){badge.className='badge badge-on';dot.className='dot dot-g';txt.textContent='Trading'}
-    else if(d.connected){badge.className='badge badge-wait';dot.className='dot dot-y';txt.textContent='Ready'}
-    else{badge.className='badge badge-off';dot.className='dot dot-r';txt.textContent='Offline'}
-    btnConn.style.display=d.connected?'none':'block';
-    if(!d.connecting){btnConn.disabled=false;btnConn.textContent='Connect to Broker'}
-    btnDisconn.style.display=d.connected?'block':'none';
-    btnRun.style.display=d.running?'none':'block';btnRun.disabled=!d.connected;
-    btnStop.style.display=d.running?'block':'none';
-    if(d.connecting){infoBanner.style.display='block'} else if(d.connected){infoBanner.style.display='none'}
-    balance.textContent='$'+(d.balance||0).toFixed(2);
-    const u=d.unrealized_pnl||0;unrealPnl.textContent=(u>=0?'+$':'-$')+Math.abs(u).toFixed(2);
-    unrealPnl.className='pnl-val '+(u>0?'profit':u<0?'loss':'neutral');
-    posCount.textContent=(d.positions||[]).length;
-    posList.innerHTML=(d.positions&&d.positions.length)?d.positions.map(p=>`<div class="pos-item"><div><span class="pos-${p.type}">${(p.type||'').toUpperCase()}</span> ${p.volume} ${p.symbol}</div><div class="${p.profit>=0?'profit':'loss'}">$${(p.profit||0).toFixed(2)}</div></div>`).join(''):'<div style="color:var(--muted);text-align:center">None</div>';
-    if(d.signals_log&&d.signals_log.length)sigLog.innerHTML=d.signals_log.map(s=>`<div>[${s.time}] ${s.text}</div>`).join('');
-    const err=d.error_message||d.connection_error;
-    if(err){errBanner.style.display='block';errBanner.textContent=err}else{errBanner.style.display='none'}
-  }catch(e){}
+  try {
+    const d = await (await fetch('/api/status')).json();
+    if(d.connecting){
+      statusBadge.className='badge badge-wait'; statusDot.className='dot dot-y'; statusText.textContent='Connecting';
+    } else if(d.connected && d.running){
+      statusBadge.className='badge badge-on'; statusDot.className='dot dot-g'; statusText.textContent='Trading';
+    } else if(d.connected){
+      statusBadge.className='badge badge-wait'; statusDot.className='dot dot-y'; statusText.textContent='Ready';
+    } else {
+      statusBadge.className='badge badge-off'; statusDot.className='dot dot-r'; statusText.textContent='Offline';
+    }
+
+    btnConn.style.display = d.connected ? 'none' : 'block';
+    if(!d.connecting){ btnConn.disabled = false; btnConn.textContent = 'Connect to Broker'; }
+    btnDisconn.style.display = d.connected ? 'block' : 'none';
+    btnRun.style.display = d.running ? 'none' : 'block';
+    btnRun.disabled = !d.connected;
+    btnStop.style.display = d.running ? 'block' : 'none';
+
+    if(d.connecting) infoBanner.style.display = 'block';
+    else if(d.connected) infoBanner.style.display = 'none';
+
+    balance.textContent = '$' + (d.balance || 0).toFixed(2);
+    const u = d.unrealized_pnl || 0;
+    unrealPnl.textContent = (u >= 0 ? '+$' : '-$') + Math.abs(u).toFixed(2);
+    unrealPnl.className = 'pnl-val ' + (u > 0 ? 'profit' : u < 0 ? 'loss' : 'neutral');
+
+    posCount.textContent = (d.positions || []).length;
+    posList.innerHTML = (d.positions && d.positions.length)
+      ? d.positions.map(p => `
+          <div class="pos-item">
+            <div><span class="pos-${p.type}">${(p.type||'').toUpperCase()}</span> ${p.volume} ${p.symbol}</div>
+            <div class="${p.profit >= 0 ? 'profit' : 'loss'}">$${(p.profit||0).toFixed(2)}</div>
+          </div>`).join('')
+      : '<div style="color:var(--muted);text-align:center;padding:10px">None</div>';
+
+    if(d.signals_log && d.signals_log.length){
+      sigLog.innerHTML = d.signals_log.map(s => `<div>[${s.time}] ${s.text}</div>`).join('');
+    }
+    if(d.trade_log && d.trade_log.length){
+      tradeLog.innerHTML = d.trade_log.map(t => `<div>[${t.time}] ${t.type} ${t.volume} ${t.symbol} @ ${t.price}</div>`).join('');
+    }
+
+    const err = d.error_message || d.connection_error;
+    if(err){ errBanner.style.display = 'block'; errBanner.textContent = err; }
+    else errBanner.style.display = 'none';
+  } catch(e){}
 }
-setInterval(update,3000);update();
+
+setInterval(update, 3000);
+update();
 </script>
 </body>
 </html>
@@ -877,7 +1095,7 @@ def index():
     return render_template_string(DASHBOARD_HTML)
 
 
-# Start loop when app loads (Gunicorn import)
+# Bootstrap async loop on import
 try:
     ensure_loop()
 except Exception as e:
