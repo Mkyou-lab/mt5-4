@@ -6,8 +6,6 @@ import time
 from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, jsonify
 from metaapi_cloud_sdk import MetaApi
-import pandas as pd
-import numpy as np
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
@@ -70,7 +68,8 @@ class HighSpeedEngine:
         self.api = None
         self.account = None
         self.connection = None
-        self.tick_history = []  # Live Price Ticks
+        self.tick_history = []
+        self.specs_cache = {}  # Prevents websocket timeout errors
 
     async def connect_with_account_id(self, token, account_id):
         try:
@@ -149,6 +148,19 @@ class HighSpeedEngine:
         add_log("⚡ HIGH-SPEED MT4/MT5 STREAM ACTIVE & READY TO TRADE!")
         return True, "Connected successfully"
 
+    async def get_symbol_spec_cached(self, symbol):
+        """ Prevents getSymbolSpecification timeout error by caching specs """
+        if symbol not in self.specs_cache:
+            try:
+                spec = await self.connection.get_symbol_specification(symbol)
+                self.specs_cache[symbol] = {
+                    "digits": spec.get("digits", 2),
+                    "point": spec.get("point", 0.01)
+                }
+            except Exception:
+                self.specs_cache[symbol] = {"digits": 2, "point": 0.01}
+        return self.specs_cache[symbol]
+
     async def update_account_info(self):
         if not self.connection:
             return
@@ -163,13 +175,16 @@ class HighSpeedEngine:
             raw_positions = await self.connection.get_positions()
             formatted_pos = []
             for p in raw_positions:
+                pos_type = str(p.get("type", ""))
+                type_str = "BUY" if "BUY" in pos_type else "SELL"
                 formatted_pos.append({
-                    "id": p.get("id"),
+                    "id": str(p.get("id")),
                     "symbol": p.get("symbol"),
-                    "type": p.get("type"),
-                    "volume": p.get("volume"),
-                    "openPrice": p.get("openPrice"),
-                    "currentPrice": p.get("currentPrice"),
+                    "type": type_str,
+                    "raw_type": pos_type,
+                    "volume": float(p.get("volume", 0.01)),
+                    "openPrice": float(p.get("openPrice", 0.0)),
+                    "currentPrice": float(p.get("currentPrice", 0.0)),
                     "profit": float(p.get("profit", 0.0)),
                     "sl": p.get("stopLoss", 0.0),
                     "tp": p.get("takeProfit", 0.0)
@@ -193,26 +208,64 @@ class HighSpeedEngine:
         except Exception:
             return requested_symbol
 
-    async def auto_manage_profits(self, symbol):
-        """ Sub-Second Profit Lock: Closes trade as soon as $ Profit Target is reached """
+    async def close_position_robust(self, position_id):
+        """ Universal close handler that handles string, int, and symbol mismatches """
+        pos_id_str = str(position_id)
+        add_log(f"Initiating close order for Position Ticket #{pos_id_str}...")
+
+        # 1. Primary Attempt
         try:
-            for pos in bot_state["open_positions"]:
-                if pos["symbol"] == symbol:
+            await self.connection.close_position(pos_id_str)
+            add_log(f"✅ Position #{pos_id_str} CLOSED successfully!")
+            await self.update_account_info()
+            return True
+        except Exception as e1:
+            # 2. Integer Ticket Fallback Attempt
+            try:
+                if pos_id_str.isdigit():
+                    await self.connection.close_position(int(pos_id_str))
+                    add_log(f"✅ Position #{pos_id_str} CLOSED successfully!")
+                    await self.update_account_info()
+                    return True
+            except Exception as e2:
+                add_log(f"❌ Close Error: {e2}")
+
+        return False
+
+    async def auto_manage_and_reverse(self, symbol, current_signal):
+        """ Closes trades in profit OR closes when market trend reverses """
+        try:
+            positions = bot_state["open_positions"]
+            target = bot_state["min_profit_target_usd"]
+
+            for pos in positions:
+                # Match symbol (e.g., BTCUSDm vs BTCUSDTm)
+                if pos["symbol"].replace("T", "") in symbol.replace("T", "") or symbol.replace("T", "") in pos["symbol"].replace("T", ""):
                     profit = pos["profit"]
-                    target = bot_state["min_profit_target_usd"]
+                    pos_type = pos["type"]
+
+                    # Rule 1: Target Profit Met -> Close immediately
                     if profit >= target:
-                        add_log(f"💰 PROFIT TARGET MET (+${profit:.2f})! Closing trade #{pos['id']} on MT5...")
-                        await self.connection.close_position(pos["id"])
-                        add_log(f"🎉 Trade #{pos['id']} CLOSED IN PROFIT! Account Balance Grew!")
-                        await self.update_account_info()
+                        add_log(f"💰 PROFIT TARGET MET (+${profit:.2f})! Closing Trade #{pos['id']} to bank profit...")
+                        await self.close_position_robust(pos["id"])
+
+                    # Rule 2: Trend Reversed & Position in Profit -> Close & Reverse!
+                    elif pos_type == "BUY" and current_signal == "SELL" and profit > 0:
+                        add_log(f"🔄 TREND REVERSED TO BEARISH 🔴! Closing BUY Trade #{pos['id']} in profit (+${profit:.2f}) to enter SELL...")
+                        await self.close_position_robust(pos["id"])
+
+                    elif pos_type == "SELL" and current_signal == "BUY" and profit > 0:
+                        add_log(f"🔄 TREND REVERSED TO BULLISH 🟢! Closing SELL Trade #{pos['id']} in profit (+${profit:.2f}) to enter BUY...")
+                        await self.close_position_robust(pos["id"])
+
         except Exception as e:
-            add_log(f"Profit Manager Note: {e}")
+            add_log(f"Manager Note: {e}")
 
     async def execute_trade(self, action, symbol, lot, sl_pips, tp_pips):
         try:
-            spec = await self.connection.get_symbol_specification(symbol)
-            digits = spec.get("digits", 2)
-            point = spec.get("point", 0.01)
+            spec = await self.get_symbol_spec_cached(symbol)
+            digits = spec["digits"]
+            point = spec["point"]
 
             price_info = await self.connection.get_symbol_price(symbol)
             entry = price_info["ask"] if action == "BUY" else price_info["bid"]
@@ -234,20 +287,11 @@ class HighSpeedEngine:
         except Exception as e:
             add_log(f"❌ Execution Error: {e}")
 
-    async def close_position(self, position_id):
-        try:
-            await self.connection.close_position(position_id)
-            add_log(f"✅ Position #{position_id} closed manually.")
-            await self.update_account_info()
-        except Exception as e:
-            add_log(f"❌ Close Error: {e}")
-
     async def run_high_frequency_loop(self):
         add_log("🚀 AGGRESSIVE INSTANT SCALPER ENGINE ACTIVE!")
         bot_state["actual_symbol"] = await self.resolve_symbol(bot_state["symbol"])
         symbol = bot_state["actual_symbol"]
 
-        # Subscribe to market data once
         try:
             await self.connection.subscribe_to_market_data(symbol)
         except Exception:
@@ -255,7 +299,7 @@ class HighSpeedEngine:
 
         while bot_state["is_running"] and bot_state["is_connected"]:
             try:
-                # 1. Fetch Price Tick
+                # 1. Fetch Real-Time Price
                 tick = await self.connection.get_symbol_price(symbol)
                 bid, ask = float(tick["bid"]), float(tick["ask"])
                 mid_price = (bid + ask) / 2.0
@@ -266,12 +310,12 @@ class HighSpeedEngine:
                     "time": datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 }
 
-                # 2. Track Live Tick Buffer
+                # 2. Tick History Buffer
                 self.tick_history.append(mid_price)
                 if len(self.tick_history) > 10:
                     self.tick_history.pop(0)
 
-                # 3. Micro Trend Analysis
+                # 3. Micro Momentum Signal Analysis
                 signal = "WAITING"
                 if len(self.tick_history) >= 3:
                     t0, t1, t2 = self.tick_history[-1], self.tick_history[-2], self.tick_history[-3]
@@ -292,11 +336,14 @@ class HighSpeedEngine:
 
                 add_log(f"📊 [{symbol}] Bid/Ask: {bid:.2f}/{ask:.2f} | Trend: {bot_state['micro_trend']} → Signal: {signal}")
 
-                # 4. Check & Lock Profits on Existing Trade
-                await self.auto_manage_profits(symbol)
+                # 4. Manage Open Profits & Reverse on Trend Change
+                await self.auto_manage_and_reverse(symbol, signal)
 
-                # 5. Open Instant Trade if No Position Exists
-                matching_positions = [p for p in bot_state["open_positions"] if p["symbol"] == symbol]
+                # 5. Open Instant Trade if Spot is Free
+                matching_positions = [
+                    p for p in bot_state["open_positions"] 
+                    if p["symbol"].replace("T", "") in symbol.replace("T", "") or symbol.replace("T", "") in p["symbol"].replace("T", "")
+                ]
 
                 if len(matching_positions) < bot_state["max_trades"] and signal in ["BUY", "SELL"]:
                     add_log(f"🔥 MOMENTUM SIGNAL ({signal}) DETECTED on {symbol}! Opening trade instantly...")
@@ -306,9 +353,8 @@ class HighSpeedEngine:
                     )
 
             except Exception as e:
-                add_log(f"Engine Loop Notice: {e}")
+                add_log(f"Loop Note: {e}")
 
-            # Polling frequency: 1 second
             await asyncio.sleep(1.0)
 
         add_log("Trading loop stopped.")
@@ -614,7 +660,7 @@ async function refreshUI() {
                 const profitClass = p.profit >= 0 ? 'text-success font-weight-bold' : 'text-danger font-weight-bold';
                 html += `<tr>
                     <td>${p.symbol}</td>
-                    <td><span class="badge ${p.type.includes('BUY') ? 'bg-success' : 'bg-danger'}">${p.type.replace('ORDER_TYPE_','')}</span></td>
+                    <td><span class="badge ${p.type === 'BUY' ? 'bg-success' : 'bg-danger'}">${p.type}</span></td>
                     <td>${p.volume}</td>
                     <td>${p.openPrice}</td>
                     <td>${p.currentPrice}</td>
@@ -779,7 +825,7 @@ def api_close_position():
     data = request.json or {}
     pos_id = data.get("position_id")
     if pos_id and bot_state["is_connected"]:
-        asyncio.run_coroutine_threadsafe(engine.close_position(pos_id), bg_loop)
+        asyncio.run_coroutine_threadsafe(engine.close_position_robust(pos_id), bg_loop)
         return jsonify(status="closing_initiated")
     return jsonify(status="failed")
 
