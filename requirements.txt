@@ -1,0 +1,7 @@
+flask==3.1.1
+flask-cors==5.0.1
+gunicorn==23.0.0
+metaapi-cloud-sdk==28.0.0
+numpy==1.26.4
+pandas==2.2.2
+python-dotenv==1.1.0
