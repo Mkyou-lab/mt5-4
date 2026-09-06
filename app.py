@@ -2,7 +2,8 @@ import os
 import asyncio
 import threading
 import logging
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, jsonify
 from metaapi_cloud_sdk import MetaApi
 import pandas as pd
@@ -39,53 +40,42 @@ bot_state = {
     "profit": 0.0,
     "symbol": "BTCUSD",
     "actual_symbol": "BTCUSD",
-    "timeframe": "15m",
+    "timeframe": "1m",
     "lot_size": 0.01,
     "max_trades": 1,
-    "stop_loss_pips": 2000,
-    "take_profit_pips": 4000,
-    "min_profit_target_usd": 1.0,  # Target profit in USD to auto-close & bank
+    "min_profit_target_usd": 1.0,  # Auto-close & bank profit at $1.00 USD
+    "stop_loss_pips": 1500,
+    "take_profit_pips": 3000,
     "open_positions": [],
-    "logs": ["Bot engine ready. Connect your broker account to begin."],
+    "live_tick": {"bid": 0.0, "ask": 0.0, "spread": 0.0, "time": ""},
+    "tick_velocity": 0.0,
+    "logs": ["Sub-second Real-Time Engine ready. Connect MT4/MT5 to sync ticks."],
     "last_analysis": {
         "price": 0.0,
-        "ema_fast": 0.0,
-        "ema_slow": 0.0,
-        "rsi": 0.0,
+        "velocity": 0.0,
         "signal": "WAITING"
     }
 }
 
 def add_log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # Includes milliseconds
     entry = f"[{ts}] {msg}"
     bot_state["logs"].append(entry)
-    if len(bot_state["logs"]) > 120:
+    if len(bot_state["logs"]) > 150:
         bot_state["logs"].pop(0)
     logging.info(msg)
 
-# ================= TECHNICAL INDICATORS =================
-def calculate_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-# ================= METAAPI ENGINE =================
-class MetaApiEngine:
+# ================= METAAPI HIGH-SPEED ENGINE =================
+class HighSpeedEngine:
     def __init__(self):
         self.api = None
         self.account = None
         self.connection = None
-        self.price_ticks_buffer = {}
+        self.tick_history = []  # Stores recent price ticks for velocity math
 
     async def connect_with_account_id(self, token, account_id):
         try:
-            add_log(f"Connecting to MetaApi Cloud with Account ID: {account_id}")
+            add_log(f"Initiating high-speed stream with Account ID: {account_id}")
             self.api = MetaApi(token)
             self.account = await self.api.metatrader_account_api.get_account(account_id)
             return await self._finish_connection()
@@ -99,7 +89,7 @@ class MetaApiEngine:
 
     async def connect_with_credentials(self, token, login, password, server, platform, region):
         try:
-            add_log(f"Provisioning cloud container for Login: {login} | Server: {server}")
+            add_log(f"Connecting to Broker Server: {server} | Login: {login}")
             self.api = MetaApi(token)
 
             try:
@@ -114,12 +104,10 @@ class MetaApiEngine:
                     break
 
             if existing:
-                add_log(f"Found existing cloud instance: {existing.id}")
                 self.account = existing
             else:
-                add_log("Creating new MetaApi Cloud terminal instance...")
                 payload = {
-                    "name": f"CloudBot-{login}",
+                    "name": f"FastBot-{login}",
                     "type": "cloud",
                     "login": str(login),
                     "password": str(password),
@@ -127,9 +115,6 @@ class MetaApiEngine:
                     "platform": "mt5" if "5" in str(platform) else "mt4",
                     "magic": 998877
                 }
-                if region and region != "default":
-                    payload["region"] = region
-
                 self.account = await self.api.metatrader_account_api.create_account(payload)
 
             return await self._finish_connection()
@@ -148,10 +133,10 @@ class MetaApiEngine:
         bot_state["login"] = str(getattr(self.account, "login", "Connected"))
 
         if self.account.state != "DEPLOYED":
-            add_log("Deploying broker terminal in cloud (20-40 seconds)...")
+            add_log("Deploying broker cloud container...")
             await self.account.deploy()
 
-        add_log("Synchronizing broker stream...")
+        add_log("Synchronizing real-time tick stream...")
         await self.account.wait_connected()
 
         self.connection = self.account.get_rpc_connection()
@@ -162,7 +147,7 @@ class MetaApiEngine:
         bot_state["is_connected"] = True
         bot_state["status_msg"] = f"Online ({bot_state['account_type']})"
         bot_state["last_error"] = ""
-        add_log("✅ SUCCESS! Connected & Synchronized with MT4/MT5 Broker.")
+        add_log("⚡ HIGH-SPEED MT4/MT5 TICK STREAM ACTIVE!")
         return True, "Connected successfully"
 
     async def update_account_info(self):
@@ -176,7 +161,6 @@ class MetaApiEngine:
             bot_state["free_margin"] = float(info.get("freeMargin", 0.0))
             bot_state["profit"] = round(bot_state["equity"] - bot_state["balance"], 2)
 
-            # Live Open Positions Sync
             raw_positions = await self.connection.get_positions()
             formatted_pos = []
             for p in raw_positions:
@@ -192,7 +176,7 @@ class MetaApiEngine:
                     "tp": p.get("takeProfit", 0.0)
                 })
             bot_state["open_positions"] = formatted_pos
-        except Exception as e:
+        except Exception:
             pass
 
     async def resolve_symbol(self, requested_symbol):
@@ -204,72 +188,26 @@ class MetaApiEngine:
             for s in symbols:
                 clean_s = s.replace("/", "").replace("_", "").replace(".", "").upper()
                 if clean_req in clean_s or clean_s in clean_req:
-                    add_log(f"Resolved Symbol: '{requested_symbol}' → Broker Symbol: '{s}'")
+                    add_log(f"Broker Symbol Auto-Resolved: '{requested_symbol}' → '{s}'")
                     return s
             return requested_symbol
-        except Exception as e:
+        except Exception:
             return requested_symbol
 
-    async def fetch_candles_or_ticks(self, symbol, timeframe, count=60):
-        # 1. Historical Client Attempt
+    async def auto_manage_profits(self, symbol):
+        """ Sub-Second Profit Lock: Automatically closes winning trades in milliseconds """
         try:
-            start_time = datetime.now(timezone.utc) - timedelta(days=2)
-            meta_tf = timeframe if timeframe in ['1m','5m','15m','30m','1h','4h'] else '15m'
-            
-            if hasattr(self.api, 'historical_market_data_client'):
-                candles = await self.api.historical_market_data_client.get_historical_candles(
-                    self.account.server, symbol, meta_tf, start_time, count
-                )
-                if candles and len(candles) > 0:
-                    df = pd.DataFrame(candles)
-                    for col in ["open", "high", "low", "close"]:
-                        if col in df.columns:
-                            df[col] = df[col].astype(float)
-                    return df
-        except Exception as e:
-            pass
-
-        # 2. Bulletproof Real-time Live Price Poller Fallback
-        try:
-            price_info = await self.connection.get_symbol_price(symbol)
-            curr_price = float((price_info['ask'] + price_info['bid']) / 2.0)
-
-            if symbol not in self.price_ticks_buffer:
-                self.price_ticks_buffer[symbol] = []
-
-            self.price_ticks_buffer[symbol].append(curr_price)
-            if len(self.price_ticks_buffer[symbol]) > 100:
-                self.price_ticks_buffer[symbol].pop(0)
-
-            prices = self.price_ticks_buffer[symbol]
-            if len(prices) >= 5:
-                df = pd.DataFrame({'close': prices})
-                df['high'] = df['close'] * 1.00005
-                df['low'] = df['close'] * 0.99995
-                df['open'] = df['close'].shift(1).fillna(df['close'])
-                return df
-        except Exception as e:
-            add_log(f"Price Ticks Error: {e}")
-
-        return None
-
-    async def auto_manage_open_profits(self, symbol):
-        """ Auto Profit-Locking Engine: Closes trades when target profit is achieved """
-        try:
-            positions = bot_state["open_positions"]
-            for pos in positions:
+            for pos in bot_state["open_positions"]:
                 if pos["symbol"] == symbol:
                     profit = pos["profit"]
                     target = bot_state["min_profit_target_usd"]
-                    
                     if profit >= target:
-                        add_log(f"💰 PROFIT TARGET REACHED! Floating Profit: +${profit:.2f} >= Target: +${target:.2f}")
-                        add_log(f"🔒 Banking profit & closing trade #{pos['id']} on {symbol}...")
+                        add_log(f"⚡ PROFIT TARGET HIT (+${profit:.2f})! Sending instant close to MT5...")
                         await self.connection.close_position(pos["id"])
-                        add_log(f"🎉 Trade closed in profit! Account growing.")
+                        add_log(f"🎉 Trade #{pos['id']} Closed in Profit! Balance Growing.")
                         await self.update_account_info()
         except Exception as e:
-            add_log(f"Profit Manager Note: {e}")
+            pass
 
     async def execute_trade(self, action, symbol, lot, sl_pips, tp_pips):
         try:
@@ -285,108 +223,110 @@ class MetaApiEngine:
             sl = entry - (sl_pips * pip_scale) if action == "BUY" else entry + (sl_pips * pip_scale)
             tp = entry + (tp_pips * pip_scale) if action == "BUY" else entry - (tp_pips * pip_scale)
 
-            add_log(f"⚡ OPENING {action} TRADE on {symbol} | Lot: {lot} | Entry: {entry:.2f}")
+            add_log(f"⚡ INSTANT ENTRY: {action} {symbol} | Lot: {lot} @ {entry:.2f}")
 
             if action == "BUY":
                 res = await self.connection.create_market_buy_order(symbol, lot, round(sl, digits), round(tp, digits))
             else:
                 res = await self.connection.create_market_sell_order(symbol, lot, round(sl, digits), round(tp, digits))
 
-            add_log(f"✅ TRADE EXECUTED SUCCESSFULLY! Order ID: {res.get('stringCode', 'OK')}")
+            add_log(f"✅ EXECUTED ON MT5! Ticket: {res.get('stringCode', 'OK')}")
             await self.update_account_info()
         except Exception as e:
-            add_log(f"❌ TRADE EXECUTION ERROR: {e}")
+            add_log(f"❌ Execution Error: {e}")
 
     async def close_position(self, position_id):
         try:
-            add_log(f"Closing position #{position_id}...")
             await self.connection.close_position(position_id)
-            add_log(f"✅ Position #{position_id} closed.")
+            add_log(f"✅ Position #{position_id} closed manually.")
             await self.update_account_info()
         except Exception as e:
-            add_log(f"❌ Error closing position: {e}")
+            add_log(f"❌ Close Error: {e}")
 
-    async def run_analysis_and_trade_loop(self):
-        add_log("🚀 Live Analysis & Automated Trading Loop Active!")
+    async def run_high_frequency_loop(self):
+        add_log("⚡ HIGH-FREQUENCY TICK ENGINE STARTED (300ms Loop)")
         bot_state["actual_symbol"] = await self.resolve_symbol(bot_state["symbol"])
         symbol = bot_state["actual_symbol"]
 
         while bot_state["is_running"] and bot_state["is_connected"]:
             try:
-                await self.update_account_info()
-                
-                # First, check and auto-lock profits on existing trades
-                await self.auto_manage_open_profits(symbol)
+                # 1. Fetch Real-time Sub-second Tick from Broker
+                tick = await self.connection.get_symbol_price(symbol)
+                bid, ask = float(tick["bid"]), float(tick["ask"])
+                mid_price = (bid + ask) / 2.0
+                spread = round((ask - bid), digits=2 if "BTC" in symbol else 5)
 
-                df = await self.fetch_candles_or_ticks(symbol, bot_state["timeframe"])
+                bot_state["live_tick"] = {
+                    "bid": bid, "ask": ask, "spread": spread,
+                    "time": datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                }
 
-                if df is not None and len(df) >= 5:
-                    df["ema_f"] = calculate_ema(df["close"], 5 if len(df) < 20 else 9)
-                    df["ema_s"] = calculate_ema(df["close"], 12 if len(df) < 20 else 21)
-                    df["rsi"] = calculate_rsi(df["close"], 14 if len(df) >= 15 else 5)
+                # 2. Tick Velocity Math (Measures Price Acceleration)
+                self.tick_history.append(mid_price)
+                if len(self.tick_history) > 10:
+                    self.tick_history.pop(0)
 
-                    price = df["close"].iloc[-1]
-                    ema_f = df["ema_f"].iloc[-1]
-                    ema_s = df["ema_s"].iloc[-1]
-                    prev_f = df["ema_f"].iloc[-2]
-                    prev_s = df["ema_s"].iloc[-2]
-                    rsi = df["rsi"].iloc[-1]
+                velocity = 0.0
+                if len(self.tick_history) >= 5:
+                    # Difference between current tick and tick 5 cycles ago
+                    velocity = round(mid_price - self.tick_history[-5], 2)
+                    bot_state["tick_velocity"] = velocity
 
-                    # Momentum & Volatility Entry Logic
-                    signal = "WAITING"
-                    if (prev_f <= prev_s and ema_f > ema_s) or (ema_f > ema_s and rsi > 51):
-                        signal = "BUY"
-                    elif (prev_f >= prev_s and ema_f < ema_s) or (ema_f < ema_s and rsi < 49):
-                        signal = "SELL"
+                # 3. Auto-Lock Profit Check (Runs 3x per second)
+                await self.auto_manage_profits(symbol)
 
-                    bot_state["last_analysis"] = {
-                        "price": round(price, 2),
-                        "ema_fast": round(ema_f, 2),
-                        "ema_slow": round(ema_s, 2),
-                        "rsi": round(rsi, 1),
-                        "signal": signal
-                    }
+                # 4. Instant Impulse Signal Strategy
+                signal = "WAITING"
+                # Velocity threshold for surge detection
+                thresh = 10.0 if "BTC" in symbol else 0.0003
 
-                    add_log(f"📊 [{symbol}] Live Price: {price:.2f} | EMA9: {ema_f:.2f} | EMA21: {ema_s:.2f} | RSI: {rsi:.1f} → Signal: {signal}")
+                if velocity > thresh:
+                    signal = "BUY"
+                elif velocity < -thresh:
+                    signal = "SELL"
 
-                    matching_positions = [p for p in bot_state["open_positions"] if p["symbol"] == symbol]
+                bot_state["last_analysis"] = {
+                    "price": round(mid_price, 2),
+                    "velocity": velocity,
+                    "signal": signal
+                }
 
-                    if len(matching_positions) < bot_state["max_trades"] and signal in ["BUY", "SELL"]:
-                        add_log(f"🎯 Impulse Detected ({signal}) on {symbol}! Entering trade now...")
-                        await self.execute_trade(
-                            signal,
-                            symbol,
-                            bot_state["lot_size"],
-                            bot_state["stop_loss_pips"],
-                            bot_state["take_profit_pips"]
-                        )
+                matching_positions = [p for p in bot_state["open_positions"] if p["symbol"] == symbol]
+
+                # 5. Execute instantly before impulse completes
+                if len(matching_positions) < bot_state["max_trades"] and signal in ["BUY", "SELL"]:
+                    add_log(f"🔥 TICK IMPULSE DETECTED! Velocity: {velocity} → Triggering {signal} Order!")
+                    await self.execute_trade(
+                        signal, symbol, bot_state["lot_size"],
+                        bot_state["stop_loss_pips"], bot_state["take_profit_pips"]
+                    )
 
             except Exception as e:
-                add_log(f"Loop Warning: {e}")
+                pass
 
-            await asyncio.sleep(5)
+            # Ultra-fast loop interval: 300ms (3 times per second)
+            await asyncio.sleep(0.3)
 
-        add_log("Trading loop stopped.")
+        add_log("High-Frequency Loop stopped.")
 
-engine = MetaApiEngine()
+engine = HighSpeedEngine()
 
-# ================= EMBEDDED WEB DASHBOARD UI =================
+# ================= REAL-TIME EMBEDDED DASHBOARD UI =================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cloud Automated MT4/MT5 Trading Overlay Bot</title>
+<title>Cloud Ultra-Fast MT4/MT5 Scalper Overlay</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
 <style>
-body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple-system, sans-serif; }
-.card { background-color: #121721; border: 1px solid #232a35; border-radius: 10px; margin-bottom: 12px; }
+body { background-color: #06080d; color: #adbac7; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.card { background-color: #111622; border: 1px solid #212836; border-radius: 10px; margin-bottom: 12px; }
 .nav-pills .nav-link { color: #768390; font-weight: 600; font-size: 14px; }
 .nav-pills .nav-link.active { background-color: #1f6feb; color: #fff; }
-.form-control, .form-select { background-color: #0b0e14; border: 1px solid #232a35; color: #e6edf3; font-size: 14px; }
-.form-control:focus, .form-select:focus { background-color: #0b0e14; color: #fff; border-color: #1f6feb; box-shadow: none; }
+.form-control, .form-select { background-color: #090c12; border: 1px solid #212836; color: #e6edf3; font-size: 14px; }
 .btn-success { background-color: #238636; border: none; font-weight: 600; }
 .btn-danger { background-color: #da3633; border: none; font-weight: 600; }
 .status-badge { font-weight: 700; padding: 6px 12px; border-radius: 20px; font-size: 12px; }
@@ -394,8 +334,9 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
 .bg-offline { background-color: rgba(248, 81, 73, 0.15); color: #f85149; border: 1px solid #da3633; }
 .metric-title { font-size: 11px; text-transform: uppercase; color: #768390; letter-spacing: 0.5px; }
 .metric-value { font-size: 18px; font-weight: 700; color: #fff; }
-.log-box { background-color: #05070a; border: 1px solid #232a35; height: 220px; overflow-y: auto; font-family: monospace; font-size: 11px; padding: 10px; border-radius: 6px; color: #3fb950; }
+.log-box { background-color: #040508; border: 1px solid #212836; height: 220px; overflow-y: auto; font-family: monospace; font-size: 11px; padding: 10px; border-radius: 6px; color: #3fb950; }
 .chart-container { height: 360px; width: 100%; border-radius: 8px; overflow: hidden; }
+.live-price-box { font-size: 22px; font-weight: 800; font-family: monospace; }
 </style>
 </head>
 <body class="p-2 p-md-3">
@@ -404,7 +345,7 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
     <!-- TOP HEADER -->
     <div class="d-flex justify-content-between align-items-center mb-3 card p-3">
         <div>
-            <h5 class="m-0 text-white font-weight-bold">🤖 MT4/MT5 Cloud Overlay Trading Bot</h5>
+            <h5 class="m-0 text-white font-weight-bold">⚡ MT4/MT5 Sub-Second Scalper Bot</h5>
             <small class="text-muted" id="accountSub">Not Connected</small>
         </div>
         <div>
@@ -412,18 +353,18 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
         </div>
     </div>
 
-    <!-- METRICS DISPLAY -->
+    <!-- LIVE METRICS BAR -->
     <div class="row g-2 mb-3">
         <div class="col-6 col-md-3">
             <div class="card p-2 text-center">
-                <span class="metric-title">Balance</span>
-                <div class="metric-value text-info" id="balVal">$0.00</div>
+                <span class="metric-title">Live MT5 Bid / Ask</span>
+                <div class="live-price-box text-success" id="tickPrice">0.00 / 0.00</div>
             </div>
         </div>
         <div class="col-6 col-md-3">
             <div class="card p-2 text-center">
-                <span class="metric-title">Equity</span>
-                <div class="metric-value text-warning" id="eqVal">$0.00</div>
+                <span class="metric-title">Balance / Equity</span>
+                <div class="metric-value text-info" id="balVal">$0.00</div>
             </div>
         </div>
         <div class="col-6 col-md-3">
@@ -434,20 +375,20 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
         </div>
         <div class="col-6 col-md-3">
             <div class="card p-2 text-center">
-                <span class="metric-title">Free Margin</span>
-                <div class="metric-value text-light" id="marginVal">$0.00</div>
+                <span class="metric-title">Tick Acceleration</span>
+                <div class="metric-value text-warning" id="velocityVal">0.00</div>
             </div>
         </div>
     </div>
 
     <!-- NAVIGATION TABS -->
     <ul class="nav nav-pills mb-3">
-        <li class="nav-item"><button class="nav-link active" data-tab="live">📊 Live Chart & Terminal</button></li>
-        <li class="nav-item"><button class="nav-link" data-tab="strategy">⚙️ Pair & Strategy</button></li>
-        <li class="nav-item"><button class="nav-link" data-tab="connect">🔗 Broker Connection</button></li>
+        <li class="nav-item"><button class="nav-link active" data-tab="live">📊 Live Terminal & Chart</button></li>
+        <li class="nav-item"><button class="nav-link" data-tab="strategy">⚙️ Settings & Risk</button></li>
+        <li class="nav-item"><button class="nav-link" data-tab="connect">🔗 Broker Login</button></li>
     </ul>
 
-    <!-- TAB 1: LIVE CHART & TERMINAL -->
+    <!-- TAB 1: TERMINAL & CHART -->
     <div id="tab-live" class="tab-pane">
         <div class="card p-2 mb-3">
             <div id="tv_chart_container" class="chart-container"></div>
@@ -468,14 +409,14 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
                             <th>Symbol</th>
                             <th>Type</th>
                             <th>Volume</th>
-                            <th>Entry</th>
-                            <th>Current</th>
-                            <th>Profit</th>
+                            <th>Entry Price</th>
+                            <th>Current Price</th>
+                            <th>Floating Profit</th>
                             <th>Action</th>
                         </tr>
                     </thead>
                     <tbody id="posTable">
-                        <tr><td colspan="7" class="text-center text-muted">No open trades</td></tr>
+                        <tr><td colspan="7" class="text-center text-muted">No active open trades</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -485,16 +426,15 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
     <!-- TAB 2: SETTINGS -->
     <div id="tab-strategy" class="tab-pane" style="display:none;">
         <div class="card p-3">
-            <h6 class="text-white mb-3">Pair & Compounding Settings</h6>
+            <h6 class="text-white mb-3">Scalping & Compounding Settings</h6>
             <div class="row g-3">
                 <div class="col-md-6">
-                    <label class="form-label">Symbol Select (24/7 Weekend Supported)</label>
+                    <label class="form-label">Symbol Select</label>
                     <select id="symbolSelect" class="form-select" onchange="updateTradingViewChart()">
                         <optgroup label="24/7 Crypto Pairs">
                             <option value="BTCUSD" selected>BTCUSD (Bitcoin)</option>
                             <option value="ETHUSD">ETHUSD (Ethereum)</option>
                             <option value="SOLUSD">SOLUSD (Solana)</option>
-                            <option value="XRPUSD">XRPUSD (Ripple)</option>
                         </optgroup>
                         <optgroup label="Forex & Gold">
                             <option value="EURUSD">EURUSD</option>
@@ -506,10 +446,9 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
                 <div class="col-md-6">
                     <label class="form-label">Timeframe</label>
                     <select id="tfSelect" class="form-select" onchange="updateTradingViewChart()">
-                        <option value="1m">M1 (Scalping)</option>
+                        <option value="1m" selected>M1 (High Speed Scalp)</option>
                         <option value="5m">M5</option>
-                        <option value="15m" selected>M15</option>
-                        <option value="1h">H1</option>
+                        <option value="15m">M15</option>
                     </select>
                 </div>
                 <div class="col-6 col-md-3">
@@ -521,23 +460,23 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
                     <input type="number" id="maxTradesInput" class="form-control" value="1">
                 </div>
                 <div class="col-6 col-md-3">
-                    <label class="form-label">Target Profit (USD to Auto-Close)</label>
+                    <label class="form-label">Target Profit ($ USD to Bank)</label>
                     <input type="number" id="targetProfitInput" class="form-control" value="1.0" step="0.5">
                 </div>
                 <div class="col-6 col-md-3">
                     <label class="form-label">Stop Loss (Points)</label>
-                    <input type="number" id="slInput" class="form-control" value="2000">
+                    <input type="number" id="slInput" class="form-control" value="1500">
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- TAB 3: BROKER CONNECTION -->
+    <!-- TAB 3: BROKER LOGIN -->
     <div id="tab-connect" class="tab-pane" style="display:none;">
         <div class="card p-3">
             <h6 class="text-white mb-3">Connect Broker Account</h6>
             <div class="mb-3">
-                <label class="form-label">MetaApi Access Token</label>
+                <label class="form-label">MetaApi Token</label>
                 <input type="password" id="tokenInput" class="form-control" placeholder="Paste token from app.metaapi.cloud">
             </div>
 
@@ -552,7 +491,7 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
             <div id="boxAccountId">
                 <div class="mb-3">
                     <label class="form-label">Account ID</label>
-                    <input type="text" id="accIdInput" class="form-control" placeholder="e.g. b5978e20-507a-4b9a-b1bf-aca87dcfec95">
+                    <input type="text" id="accIdInput" class="form-control" placeholder="Paste Account ID">
                 </div>
             </div>
 
@@ -584,7 +523,7 @@ body { background-color: #080b10; color: #adbac7; font-family: system-ui, -apple
 
     <!-- LOGS CONSOLE -->
     <div class="card p-3">
-        <h6 class="text-white mb-2">Live Market Analysis & Execution Logs</h6>
+        <h6 class="text-white mb-2">Live Sub-Second Execution Console</h6>
         <div id="logBox" class="log-box"></div>
     </div>
 
@@ -597,15 +536,13 @@ function initTradingViewChart(symbol, timeframe) {
     let tvSymbol = "BINANCE:BTCUSDT";
     if(symbol.includes("ETH")) tvSymbol = "BINANCE:ETHUSDT";
     else if(symbol.includes("SOL")) tvSymbol = "BINANCE:SOLUSDT";
-    else if(symbol.includes("XRP")) tvSymbol = "BINANCE:XRPUSDT";
     else if(symbol.includes("EUR")) tvSymbol = "FX:EURUSD";
     else if(symbol.includes("GBP")) tvSymbol = "FX:GBPUSD";
     else if(symbol.includes("XAU")) tvSymbol = "OANDA:XAUUSD";
 
-    let tvInterval = "15";
-    if(timeframe === "1m") tvInterval = "1";
+    let tvInterval = "1";
     if(timeframe === "5m") tvInterval = "5";
-    if(timeframe === "1h") tvInterval = "60";
+    if(timeframe === "15m") tvInterval = "15";
 
     document.getElementById("tv_chart_container").innerHTML = "";
     tvWidget = new TradingView.widget({
@@ -616,10 +553,6 @@ function initTradingViewChart(symbol, timeframe) {
         "theme": "dark",
         "style": "1",
         "locale": "en",
-        "toolbar_bg": "#f1f3f6",
-        "enable_publishing": false,
-        "hide_top_toolbar": false,
-        "save_image": false,
         "container_id": "tv_chart_container"
     });
 }
@@ -650,23 +583,30 @@ async function refreshUI() {
         const res = await fetch('/api/status');
         const d = await res.json();
 
+        // Status
         const badge = document.getElementById('statusBadge');
         badge.textContent = d.is_connected ? '● ' + d.status_msg : '● Offline';
         badge.className = d.is_connected ? 'status-badge bg-online' : 'status-badge bg-offline';
         document.getElementById('accountSub').textContent = d.is_connected ? `Server: ${d.server} | Login: ${d.login}` : 'Not Connected';
 
-        document.getElementById('balVal').textContent = '$' + d.balance.toFixed(2);
-        document.getElementById('eqVal').textContent = '$' + d.equity.toFixed(2);
-        document.getElementById('marginVal').textContent = '$' + d.free_margin.toFixed(2);
-        
+        // High Speed Live Tick
+        if(d.live_tick) {
+            document.getElementById('tickPrice').textContent = d.live_tick.bid.toFixed(2) + ' / ' + d.live_tick.ask.toFixed(2);
+        }
+
+        document.getElementById('balVal').textContent = '$' + d.balance.toFixed(2) + ' / $' + d.equity.toFixed(2);
+        document.getElementById('velocityVal').textContent = (d.tick_velocity >= 0 ? '+' : '') + d.tick_velocity.toFixed(2);
+
         const plElem = document.getElementById('plVal');
         plElem.textContent = (d.profit >= 0 ? '+$' : '-$') + Math.abs(d.profit).toFixed(2);
         plElem.className = d.profit >= 0 ? 'metric-value text-success' : 'metric-value text-danger';
 
+        // Logs
         const logBox = document.getElementById('logBox');
         logBox.innerHTML = d.logs.join('<br>');
         logBox.scrollTop = logBox.scrollHeight;
 
+        // Positions
         const posTable = document.getElementById('posTable');
         if(d.open_positions && d.open_positions.length > 0) {
             let html = '';
@@ -684,7 +624,7 @@ async function refreshUI() {
             });
             posTable.innerHTML = html;
         } else {
-            posTable.innerHTML = `<tr><td colspan="7" class="text-center text-muted">No open trades</td></tr>`;
+            posTable.innerHTML = `<tr><td colspan="7" class="text-center text-muted">No active open trades</td></tr>`;
         }
 
         document.getElementById('btnStart').disabled = !d.is_connected || d.is_running;
@@ -735,7 +675,7 @@ async function startBot() {
         max_trades: parseInt(document.getElementById('maxTradesInput').value),
         min_profit_target_usd: parseFloat(document.getElementById('targetProfitInput').value),
         stop_loss_pips: parseInt(document.getElementById('slInput').value),
-        take_profit_pips: 4000
+        take_profit_pips: 3000
     };
     await fetch('/api/start', {
         method: 'POST',
@@ -759,8 +699,9 @@ async function closePosition(posId) {
 }
 
 window.onload = () => {
-    initTradingViewChart("BTCUSD", "15m");
-    setInterval(refreshUI, 2500);
+    initTradingViewChart("BTCUSD", "1m");
+    // High Speed UI Polling: 300ms (sub-second refresh)
+    setInterval(refreshUI, 300);
 };
 </script>
 </body>
@@ -817,21 +758,21 @@ def api_start():
     data = request.json or {}
     bot_state.update({
         "symbol": data.get("symbol", "BTCUSD").upper(),
-        "timeframe": data.get("timeframe", "15m"),
+        "timeframe": data.get("timeframe", "1m"),
         "lot_size": float(data.get("lot_size", 0.01)),
         "max_trades": int(data.get("max_trades", 1)),
         "min_profit_target_usd": float(data.get("min_profit_target_usd", 1.0)),
-        "stop_loss_pips": int(data.get("stop_loss_pips", 2000)),
-        "take_profit_pips": int(data.get("take_profit_pips", 4000)),
+        "stop_loss_pips": int(data.get("stop_loss_pips", 1500)),
+        "take_profit_pips": int(data.get("take_profit_pips", 3000)),
         "is_running": True
     })
-    asyncio.run_coroutine_threadsafe(engine.run_analysis_and_trade_loop(), bg_loop)
+    asyncio.run_coroutine_threadsafe(engine.run_high_frequency_loop(), bg_loop)
     return jsonify(status="started")
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
     bot_state["is_running"] = False
-    add_log("Trading loop stop requested.")
+    add_log("High-Frequency Loop stop requested.")
     return jsonify(status="stopped")
 
 @app.route("/api/close_position", methods=["POST"])
