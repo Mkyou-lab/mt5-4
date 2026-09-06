@@ -43,25 +43,24 @@ bot_state = {
     "timeframe": "1m",
     "lot_size": 0.01,
     "max_trades": 1,
-    "min_profit_target_usd": 1.0,  # Auto-close & bank profit at $1.00 USD
+    "min_profit_target_usd": 0.50,  # Auto-close & bank profit at $0.50 USD
     "stop_loss_pips": 1500,
     "take_profit_pips": 3000,
     "open_positions": [],
     "live_tick": {"bid": 0.0, "ask": 0.0, "spread": 0.0, "time": ""},
-    "tick_velocity": 0.0,
-    "logs": ["Sub-second Real-Time Engine ready. Connect MT4/MT5 to sync ticks."],
+    "micro_trend": "NEUTRAL",
+    "logs": ["Sub-Second Scalping Engine Ready. Connect MT4/MT5 to start."],
     "last_analysis": {
         "price": 0.0,
-        "velocity": 0.0,
         "signal": "WAITING"
     }
 }
 
 def add_log(msg):
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # Includes milliseconds
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     entry = f"[{ts}] {msg}"
     bot_state["logs"].append(entry)
-    if len(bot_state["logs"]) > 150:
+    if len(bot_state["logs"]) > 120:
         bot_state["logs"].pop(0)
     logging.info(msg)
 
@@ -71,11 +70,11 @@ class HighSpeedEngine:
         self.api = None
         self.account = None
         self.connection = None
-        self.tick_history = []  # Stores recent price ticks for velocity math
+        self.tick_history = []  # Live Price Ticks
 
     async def connect_with_account_id(self, token, account_id):
         try:
-            add_log(f"Initiating high-speed stream with Account ID: {account_id}")
+            add_log(f"Connecting to MetaApi Cloud with Account ID: {account_id}")
             self.api = MetaApi(token)
             self.account = await self.api.metatrader_account_api.get_account(account_id)
             return await self._finish_connection()
@@ -133,10 +132,10 @@ class HighSpeedEngine:
         bot_state["login"] = str(getattr(self.account, "login", "Connected"))
 
         if self.account.state != "DEPLOYED":
-            add_log("Deploying broker cloud container...")
+            add_log("Deploying broker terminal container...")
             await self.account.deploy()
 
-        add_log("Synchronizing real-time tick stream...")
+        add_log("Synchronizing live price stream...")
         await self.account.wait_connected()
 
         self.connection = self.account.get_rpc_connection()
@@ -147,7 +146,7 @@ class HighSpeedEngine:
         bot_state["is_connected"] = True
         bot_state["status_msg"] = f"Online ({bot_state['account_type']})"
         bot_state["last_error"] = ""
-        add_log("⚡ HIGH-SPEED MT4/MT5 TICK STREAM ACTIVE!")
+        add_log("⚡ HIGH-SPEED MT4/MT5 STREAM ACTIVE & READY TO TRADE!")
         return True, "Connected successfully"
 
     async def update_account_info(self):
@@ -188,26 +187,26 @@ class HighSpeedEngine:
             for s in symbols:
                 clean_s = s.replace("/", "").replace("_", "").replace(".", "").upper()
                 if clean_req in clean_s or clean_s in clean_req:
-                    add_log(f"Broker Symbol Auto-Resolved: '{requested_symbol}' → '{s}'")
+                    add_log(f"Broker Symbol Resolved: '{requested_symbol}' → '{s}'")
                     return s
             return requested_symbol
         except Exception:
             return requested_symbol
 
     async def auto_manage_profits(self, symbol):
-        """ Sub-Second Profit Lock: Automatically closes winning trades in milliseconds """
+        """ Sub-Second Profit Lock: Closes trade as soon as $ Profit Target is reached """
         try:
             for pos in bot_state["open_positions"]:
                 if pos["symbol"] == symbol:
                     profit = pos["profit"]
                     target = bot_state["min_profit_target_usd"]
                     if profit >= target:
-                        add_log(f"⚡ PROFIT TARGET HIT (+${profit:.2f})! Sending instant close to MT5...")
+                        add_log(f"💰 PROFIT TARGET MET (+${profit:.2f})! Closing trade #{pos['id']} on MT5...")
                         await self.connection.close_position(pos["id"])
-                        add_log(f"🎉 Trade #{pos['id']} Closed in Profit! Balance Growing.")
+                        add_log(f"🎉 Trade #{pos['id']} CLOSED IN PROFIT! Account Balance Grew!")
                         await self.update_account_info()
         except Exception as e:
-            pass
+            add_log(f"Profit Manager Note: {e}")
 
     async def execute_trade(self, action, symbol, lot, sl_pips, tp_pips):
         try:
@@ -223,14 +222,14 @@ class HighSpeedEngine:
             sl = entry - (sl_pips * pip_scale) if action == "BUY" else entry + (sl_pips * pip_scale)
             tp = entry + (tp_pips * pip_scale) if action == "BUY" else entry - (tp_pips * pip_scale)
 
-            add_log(f"⚡ INSTANT ENTRY: {action} {symbol} | Lot: {lot} @ {entry:.2f}")
+            add_log(f"⚡ EXECUTING {action} ORDER on {symbol} | Lot: {lot} @ Entry: {entry:.2f}")
 
             if action == "BUY":
                 res = await self.connection.create_market_buy_order(symbol, lot, round(sl, digits), round(tp, digits))
             else:
                 res = await self.connection.create_market_sell_order(symbol, lot, round(sl, digits), round(tp, digits))
 
-            add_log(f"✅ EXECUTED ON MT5! Ticket: {res.get('stringCode', 'OK')}")
+            add_log(f"✅ EXECUTED ON BROKER! Ticket: {res.get('stringCode', 'CONFIRMED')}")
             await self.update_account_info()
         except Exception as e:
             add_log(f"❌ Execution Error: {e}")
@@ -244,85 +243,90 @@ class HighSpeedEngine:
             add_log(f"❌ Close Error: {e}")
 
     async def run_high_frequency_loop(self):
-        add_log("⚡ HIGH-FREQUENCY TICK ENGINE STARTED (300ms Loop)")
+        add_log("🚀 AGGRESSIVE INSTANT SCALPER ENGINE ACTIVE!")
         bot_state["actual_symbol"] = await self.resolve_symbol(bot_state["symbol"])
         symbol = bot_state["actual_symbol"]
 
+        # Subscribe to market data once
+        try:
+            await self.connection.subscribe_to_market_data(symbol)
+        except Exception:
+            pass
+
         while bot_state["is_running"] and bot_state["is_connected"]:
             try:
-                # 1. Fetch Real-time Sub-second Tick from Broker
+                # 1. Fetch Price Tick
                 tick = await self.connection.get_symbol_price(symbol)
                 bid, ask = float(tick["bid"]), float(tick["ask"])
                 mid_price = (bid + ask) / 2.0
-                spread = round((ask - bid), digits=2 if "BTC" in symbol else 5)
+                spread = round((ask - bid), 2 if "BTC" in symbol else 5)
 
                 bot_state["live_tick"] = {
                     "bid": bid, "ask": ask, "spread": spread,
                     "time": datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 }
 
-                # 2. Tick Velocity Math (Measures Price Acceleration)
+                # 2. Track Live Tick Buffer
                 self.tick_history.append(mid_price)
                 if len(self.tick_history) > 10:
                     self.tick_history.pop(0)
 
-                velocity = 0.0
-                if len(self.tick_history) >= 5:
-                    # Difference between current tick and tick 5 cycles ago
-                    velocity = round(mid_price - self.tick_history[-5], 2)
-                    bot_state["tick_velocity"] = velocity
-
-                # 3. Auto-Lock Profit Check (Runs 3x per second)
-                await self.auto_manage_profits(symbol)
-
-                # 4. Instant Impulse Signal Strategy
+                # 3. Micro Trend Analysis
                 signal = "WAITING"
-                # Velocity threshold for surge detection
-                thresh = 10.0 if "BTC" in symbol else 0.0003
-
-                if velocity > thresh:
-                    signal = "BUY"
-                elif velocity < -thresh:
-                    signal = "SELL"
+                if len(self.tick_history) >= 3:
+                    t0, t1, t2 = self.tick_history[-1], self.tick_history[-2], self.tick_history[-3]
+                    
+                    if t0 > t1 and t1 >= t2:
+                        signal = "BUY"
+                        bot_state["micro_trend"] = "BULLISH 🟢"
+                    elif t0 < t1 and t1 <= t2:
+                        signal = "SELL"
+                        bot_state["micro_trend"] = "BEARISH 🔴"
+                    else:
+                        bot_state["micro_trend"] = "CONSOLIDATING 🟡"
 
                 bot_state["last_analysis"] = {
                     "price": round(mid_price, 2),
-                    "velocity": velocity,
                     "signal": signal
                 }
 
+                add_log(f"📊 [{symbol}] Bid/Ask: {bid:.2f}/{ask:.2f} | Trend: {bot_state['micro_trend']} → Signal: {signal}")
+
+                # 4. Check & Lock Profits on Existing Trade
+                await self.auto_manage_profits(symbol)
+
+                # 5. Open Instant Trade if No Position Exists
                 matching_positions = [p for p in bot_state["open_positions"] if p["symbol"] == symbol]
 
-                # 5. Execute instantly before impulse completes
                 if len(matching_positions) < bot_state["max_trades"] and signal in ["BUY", "SELL"]:
-                    add_log(f"🔥 TICK IMPULSE DETECTED! Velocity: {velocity} → Triggering {signal} Order!")
+                    add_log(f"🔥 MOMENTUM SIGNAL ({signal}) DETECTED on {symbol}! Opening trade instantly...")
                     await self.execute_trade(
                         signal, symbol, bot_state["lot_size"],
                         bot_state["stop_loss_pips"], bot_state["take_profit_pips"]
                     )
 
             except Exception as e:
-                pass
+                add_log(f"Engine Loop Notice: {e}")
 
-            # Ultra-fast loop interval: 300ms (3 times per second)
-            await asyncio.sleep(0.3)
+            # Polling frequency: 1 second
+            await asyncio.sleep(1.0)
 
-        add_log("High-Frequency Loop stopped.")
+        add_log("Trading loop stopped.")
 
 engine = HighSpeedEngine()
 
-# ================= REAL-TIME EMBEDDED DASHBOARD UI =================
+# ================= EMBEDDED DASHBOARD UI =================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cloud Ultra-Fast MT4/MT5 Scalper Overlay</title>
+<title>Cloud MT4/MT5 Scalper Bot Overlay</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
 <style>
-body { background-color: #06080d; color: #adbac7; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+body { background-color: #06080d; color: #adbac7; font-family: system-ui, -apple-system, sans-serif; }
 .card { background-color: #111622; border: 1px solid #212836; border-radius: 10px; margin-bottom: 12px; }
 .nav-pills .nav-link { color: #768390; font-weight: 600; font-size: 14px; }
 .nav-pills .nav-link.active { background-color: #1f6feb; color: #fff; }
@@ -334,9 +338,9 @@ body { background-color: #06080d; color: #adbac7; font-family: -apple-system, Bl
 .bg-offline { background-color: rgba(248, 81, 73, 0.15); color: #f85149; border: 1px solid #da3633; }
 .metric-title { font-size: 11px; text-transform: uppercase; color: #768390; letter-spacing: 0.5px; }
 .metric-value { font-size: 18px; font-weight: 700; color: #fff; }
-.log-box { background-color: #040508; border: 1px solid #212836; height: 220px; overflow-y: auto; font-family: monospace; font-size: 11px; padding: 10px; border-radius: 6px; color: #3fb950; }
+.log-box { background-color: #040508; border: 1px solid #212836; height: 230px; overflow-y: auto; font-family: monospace; font-size: 11px; padding: 10px; border-radius: 6px; color: #3fb950; }
 .chart-container { height: 360px; width: 100%; border-radius: 8px; overflow: hidden; }
-.live-price-box { font-size: 22px; font-weight: 800; font-family: monospace; }
+.live-price-box { font-size: 20px; font-weight: 800; font-family: monospace; }
 </style>
 </head>
 <body class="p-2 p-md-3">
@@ -345,7 +349,7 @@ body { background-color: #06080d; color: #adbac7; font-family: -apple-system, Bl
     <!-- TOP HEADER -->
     <div class="d-flex justify-content-between align-items-center mb-3 card p-3">
         <div>
-            <h5 class="m-0 text-white font-weight-bold">⚡ MT4/MT5 Sub-Second Scalper Bot</h5>
+            <h5 class="m-0 text-white font-weight-bold">⚡ MT4/MT5 Instant Scalper Bot</h5>
             <small class="text-muted" id="accountSub">Not Connected</small>
         </div>
         <div>
@@ -375,8 +379,8 @@ body { background-color: #06080d; color: #adbac7; font-family: -apple-system, Bl
         </div>
         <div class="col-6 col-md-3">
             <div class="card p-2 text-center">
-                <span class="metric-title">Tick Acceleration</span>
-                <div class="metric-value text-warning" id="velocityVal">0.00</div>
+                <span class="metric-title">Micro Momentum</span>
+                <div class="metric-value text-warning" id="trendVal">NEUTRAL</div>
             </div>
         </div>
     </div>
@@ -426,7 +430,7 @@ body { background-color: #06080d; color: #adbac7; font-family: -apple-system, Bl
     <!-- TAB 2: SETTINGS -->
     <div id="tab-strategy" class="tab-pane" style="display:none;">
         <div class="card p-3">
-            <h6 class="text-white mb-3">Scalping & Compounding Settings</h6>
+            <h6 class="text-white mb-3">Scalping & Target Settings</h6>
             <div class="row g-3">
                 <div class="col-md-6">
                     <label class="form-label">Symbol Select</label>
@@ -461,7 +465,7 @@ body { background-color: #06080d; color: #adbac7; font-family: -apple-system, Bl
                 </div>
                 <div class="col-6 col-md-3">
                     <label class="form-label">Target Profit ($ USD to Bank)</label>
-                    <input type="number" id="targetProfitInput" class="form-control" value="1.0" step="0.5">
+                    <input type="number" id="targetProfitInput" class="form-control" value="0.50" step="0.25">
                 </div>
                 <div class="col-6 col-md-3">
                     <label class="form-label">Stop Loss (Points)</label>
@@ -523,7 +527,7 @@ body { background-color: #06080d; color: #adbac7; font-family: -apple-system, Bl
 
     <!-- LOGS CONSOLE -->
     <div class="card p-3">
-        <h6 class="text-white mb-2">Live Sub-Second Execution Console</h6>
+        <h6 class="text-white mb-2">Live Execution & Analysis Console</h6>
         <div id="logBox" class="log-box"></div>
     </div>
 
@@ -583,30 +587,26 @@ async function refreshUI() {
         const res = await fetch('/api/status');
         const d = await res.json();
 
-        // Status
         const badge = document.getElementById('statusBadge');
         badge.textContent = d.is_connected ? '● ' + d.status_msg : '● Offline';
         badge.className = d.is_connected ? 'status-badge bg-online' : 'status-badge bg-offline';
         document.getElementById('accountSub').textContent = d.is_connected ? `Server: ${d.server} | Login: ${d.login}` : 'Not Connected';
 
-        // High Speed Live Tick
         if(d.live_tick) {
             document.getElementById('tickPrice').textContent = d.live_tick.bid.toFixed(2) + ' / ' + d.live_tick.ask.toFixed(2);
         }
 
         document.getElementById('balVal').textContent = '$' + d.balance.toFixed(2) + ' / $' + d.equity.toFixed(2);
-        document.getElementById('velocityVal').textContent = (d.tick_velocity >= 0 ? '+' : '') + d.tick_velocity.toFixed(2);
+        document.getElementById('trendVal').textContent = d.micro_trend || 'NEUTRAL';
 
         const plElem = document.getElementById('plVal');
         plElem.textContent = (d.profit >= 0 ? '+$' : '-$') + Math.abs(d.profit).toFixed(2);
         plElem.className = d.profit >= 0 ? 'metric-value text-success' : 'metric-value text-danger';
 
-        // Logs
         const logBox = document.getElementById('logBox');
         logBox.innerHTML = d.logs.join('<br>');
         logBox.scrollTop = logBox.scrollHeight;
 
-        // Positions
         const posTable = document.getElementById('posTable');
         if(d.open_positions && d.open_positions.length > 0) {
             let html = '';
@@ -700,8 +700,7 @@ async function closePosition(posId) {
 
 window.onload = () => {
     initTradingViewChart("BTCUSD", "1m");
-    // High Speed UI Polling: 300ms (sub-second refresh)
-    setInterval(refreshUI, 300);
+    setInterval(refreshUI, 1000);
 };
 </script>
 </body>
@@ -761,7 +760,7 @@ def api_start():
         "timeframe": data.get("timeframe", "1m"),
         "lot_size": float(data.get("lot_size", 0.01)),
         "max_trades": int(data.get("max_trades", 1)),
-        "min_profit_target_usd": float(data.get("min_profit_target_usd", 1.0)),
+        "min_profit_target_usd": float(data.get("min_profit_target_usd", 0.50)),
         "stop_loss_pips": int(data.get("stop_loss_pips", 1500)),
         "take_profit_pips": int(data.get("take_profit_pips", 3000)),
         "is_running": True
@@ -772,7 +771,7 @@ def api_start():
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
     bot_state["is_running"] = False
-    add_log("High-Frequency Loop stop requested.")
+    add_log("Instant Scalper stop requested.")
     return jsonify(status="stopped")
 
 @app.route("/api/close_position", methods=["POST"])
