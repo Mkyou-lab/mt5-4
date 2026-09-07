@@ -1,9 +1,10 @@
 import os
 import re
+import math
 import asyncio
 import threading
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, render_template_string, request, jsonify, Response
 from metaapi_cloud_sdk import MetaApi
@@ -38,43 +39,39 @@ S = {
     "symbol": "XAUUSD",
     "real_symbol": "XAUUSD",
     "lot": 0.01,
-    "max_trades": 1,
-    "target_profit": 0.80,
-    "min_score": 60,
-    "sl_points": 250,
-    "tp_points": 500,   # TP twice SL by default (better R:R)
-    "flip_signals": False,
     "positions": [],
     "tick": {"bid": 0.0, "ask": 0.0},
     "direction": "WAITING",
     "score": 0,
     "phase": "SCAN",
+    "session": "UNKNOWN",
     "last_action": "—",
-    "logs": ["Pullback-Continuation engine ready. Connect → RUN."]
+    "day_start_balance": 0.0,
+    "day_pnl": 0.0,
+    "logs": ["Auto-Pilot ready. Connect once, press RUN. No manual tuning required."]
 }
 
 def log(msg):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
     S["logs"].append(line)
-    if len(S["logs"]) > 160:
+    if len(S["logs"]) > 180:
         S["logs"].pop(0)
     print(line)
 
-class Engine:
+class AutoPilot:
     def __init__(self):
         self.api = None
         self.account = None
         self.conn = None
         self.prices = []
         self.specs = {}
-        # setup memory
-        self.impulse = None          # "UP" or "DOWN"
+        self.impulse = None
         self.impulse_price = None
-        self.impulse_time = 0.0
+        self.impulse_ts = 0.0
         self.pullback_seen = False
         self.pullback_ext = None
         self.last_entry_ts = 0.0
-        self.be_done = set()
+        self.trailed = {}
 
     def fix_server(self, server):
         if not server:
@@ -115,7 +112,7 @@ class Engine:
         else:
             log("Creating cloud account...")
             self.account = await self.api.metatrader_account_api.create_account({
-                "name": f"MK-{login}",
+                "name": f"Auto-{login}",
                 "type": "cloud",
                 "login": str(login),
                 "password": str(password),
@@ -138,10 +135,11 @@ class Engine:
         await self.conn.connect()
         await self.conn.wait_synchronized()
         await self.refresh()
+        S["day_start_balance"] = S["balance"] or S["equity"]
         S["connected"] = True
         S["status"] = f"Online • {S['account_type']}"
         S["error"] = ""
-        log("✅ Connected")
+        log("✅ Connected — Auto-Pilot armed")
         return True, "OK"
 
     async def refresh(self):
@@ -152,6 +150,8 @@ class Engine:
             S["balance"] = float(info.get("balance", 0))
             S["equity"] = float(info.get("equity", 0))
             S["profit"] = round(S["equity"] - S["balance"], 2)
+            if S["day_start_balance"] > 0:
+                S["day_pnl"] = round(S["equity"] - S["day_start_balance"], 2)
             raw = await self.conn.get_positions()
             out = []
             for p in raw:
@@ -169,7 +169,7 @@ class Engine:
                 })
             S["positions"] = out
         except Exception as e:
-            log(f"Refresh note: {e}")
+            log(f"Refresh: {e}")
 
     async def resolve(self, symbol):
         try:
@@ -191,6 +191,21 @@ class Engine:
         except Exception:
             return symbol
 
+    async def pick_symbol(self):
+        """Auto pick a liquid symbol if possible."""
+        preferred = ["XAUUSD", "BTCUSD", "EURUSD", "GBPUSD", "ETHUSD"]
+        try:
+            symbols = await self.conn.get_symbols()
+            upper_map = {re.sub(r"[/._]", "", s.upper()): s for s in symbols}
+            for p in preferred:
+                key = p.upper()
+                for k, real in upper_map.items():
+                    if key in k:
+                        return real
+            return symbols[0] if symbols else "XAUUSD"
+        except Exception:
+            return S.get("symbol") or "XAUUSD"
+
     async def load_spec(self, symbol):
         if symbol in self.specs:
             return self.specs[symbol]
@@ -203,13 +218,15 @@ class Engine:
                 "max_volume": float(sp.get("maxVolume", sp.get("volumeMax", 100)) or 100),
                 "volume_step": float(sp.get("volumeStep", 0.01) or 0.01),
                 "stops_level": float(sp.get("stopsLevel", sp.get("tradeStopsLevel", 0)) or 0),
+                "tick_value": float(sp.get("tickValue", 0) or 0),
+                "tick_size": float(sp.get("tickSize", 0) or 0),
             }
             self.specs[symbol] = spec
             log(f"Spec {symbol}: point={spec['point']} stops={spec['stops_level']} minLot={spec['min_volume']}")
             return spec
         except Exception as e:
-            log(f"Spec fallback ({e})")
-            spec = {"digits": 2, "point": 0.01, "min_volume": 0.01, "max_volume": 100, "volume_step": 0.01, "stops_level": 0}
+            log(f"Spec fallback: {e}")
+            spec = {"digits": 2, "point": 0.01, "min_volume": 0.01, "max_volume": 100, "volume_step": 0.01, "stops_level": 0, "tick_value": 0, "tick_size": 0}
             self.specs[symbol] = spec
             return spec
 
@@ -225,174 +242,233 @@ class Engine:
         y = re.sub(r"[T._]", "", str(b).upper())
         return x in y or y in x
 
+    def session_now(self):
+        # UTC hours rough session map
+        h = datetime.now(timezone.utc).hour
+        if 7 <= h < 10:
+            return "LONDON_OPEN", 1.0
+        if 12 <= h < 16:
+            return "NY_OVERLAP", 1.1
+        if 0 <= h < 6:
+            return "ASIA", 0.7
+        if 16 <= h < 21:
+            return "NY", 0.95
+        return "OFFPEAK", 0.6
+
+    def news_caution(self):
+        """
+        Lightweight caution windows (UTC) around common high-impact times.
+        Not a full news calendar, but reduces trading into obvious risk windows.
+        """
+        now = datetime.now(timezone.utc)
+        # top of hour :00-:03 and :30-:33 often event prints
+        if now.minute in (0, 1, 2, 30, 31, 32):
+            return True, "clock-event-window"
+        # Friday late / Sunday open caution
+        if now.weekday() == 4 and now.hour >= 18:
+            return True, "friday-late"
+        if now.weekday() == 6:
+            return True, "sunday"
+        return False, ""
+
+    def auto_lot(self, balance, spec, symbol):
+        # Risk small and compound slowly
+        risk_pct = 0.007  # 0.7% risk budget reference
+        equity = max(balance, 1.0)
+        # base by balance tiers
+        if equity < 50:
+            lot = spec["min_volume"]
+        elif equity < 200:
+            lot = max(spec["min_volume"], 0.01)
+        elif equity < 1000:
+            lot = 0.02
+        elif equity < 5000:
+            lot = 0.05
+        else:
+            lot = min(0.20, equity / 100000)  # conservative
+        # metals often need smaller
+        if "XAU" in symbol and lot > 0.05:
+            lot = 0.05
+        if "BTC" in symbol and lot > 0.05:
+            lot = 0.05
+        return self.normalize_lot(lot, spec)
+
+    def atr_like(self):
+        if len(self.prices) < 20:
+            return None
+        seg = self.prices[-20:]
+        hi, lo = max(seg), min(seg)
+        return max(hi - lo, 1e-8)
+
     def thresholds(self, symbol):
+        atr = self.atr_like()
         if "XAU" in symbol:
-            return {"impulse": 0.12, "pullback": 0.05, "continue": 0.04, "spread_max": 0.60}
+            base = {"impulse": 0.15, "pullback": 0.06, "continue": 0.05, "spread_max": 0.70}
+        elif "BTC" in symbol:
+            base = {"impulse": 10.0, "pullback": 4.0, "continue": 3.0, "spread_max": 30.0}
+        elif "ETH" in symbol:
+            base = {"impulse": 1.8, "pullback": 0.7, "continue": 0.55, "spread_max": 2.5}
+        else:
+            base = {"impulse": 0.00030, "pullback": 0.00012, "continue": 0.00010, "spread_max": 0.00035}
+        if atr:
+            # adapt a bit to current range
+            base["impulse"] = max(base["impulse"], atr * 0.25)
+            base["pullback"] = max(base["pullback"], atr * 0.10)
+            base["continue"] = max(base["continue"], atr * 0.08)
+        return base
+
+    def build_sl_tp(self, side, entry, spec, symbol):
+        digits = spec["digits"]
+        point = spec["point"] if spec["point"] > 0 else 0.01
+        stops = spec["stops_level"]
+        atr = self.atr_like() or (50 * point)
+
+        # SL around 0.8–1.2 ATR, TP around 1.6–2.2 ATR
+        sl_dist = max(atr * 0.9, (stops + 10) * point, 30 * point)
+        tp_dist = max(atr * 1.8, sl_dist * 1.7)
+
+        if "XAU" in symbol:
+            sl_dist = max(sl_dist, 0.8)
+            tp_dist = max(tp_dist, 1.6)
         if "BTC" in symbol:
-            return {"impulse": 8.0, "pullback": 3.0, "continue": 2.5, "spread_max": 25.0}
-        if "ETH" in symbol:
-            return {"impulse": 1.5, "pullback": 0.6, "continue": 0.5, "spread_max": 2.0}
-        return {"impulse": 0.00025, "pullback": 0.00010, "continue": 0.00008, "spread_max": 0.00030}
+            sl_dist = max(sl_dist, 40)
+            tp_dist = max(tp_dist, 80)
+
+        if side == "BUY":
+            sl, tp = entry - sl_dist, entry + tp_dist
+        else:
+            sl, tp = entry + sl_dist, entry - tp_dist
+        return round(sl, digits), round(tp, digits), sl_dist, tp_dist
 
     async def close(self, pid):
         try:
             await self.conn.close_position(str(pid))
             log(f"💰 Closed #{pid}")
             S["last_action"] = f"Closed #{pid}"
-            self.be_done.discard(str(pid))
+            self.trailed.pop(str(pid), None)
             await self.refresh()
             return True
         except Exception:
             try:
                 await self.conn.close_position(int(pid))
                 log(f"💰 Closed #{pid}")
-                self.be_done.discard(str(pid))
+                self.trailed.pop(str(pid), None)
                 await self.refresh()
                 return True
             except Exception as e:
                 log(f"Close error: {e}")
                 return False
 
-    def build_sl_tp(self, side, entry, spec, sl_points, tp_points):
-        digits = spec["digits"]
-        point = spec["point"] if spec["point"] > 0 else 0.01
-        stops_level = spec["stops_level"]
-        sl_pts = max(float(sl_points), stops_level + 5, 30)
-        tp_pts = max(float(tp_points), sl_pts * 1.5, stops_level + 5, 40)  # force better R:R
-        sl_dist = sl_pts * point
-        tp_dist = tp_pts * point
-        if side == "BUY":
-            sl, tp = entry - sl_dist, entry + tp_dist
-        else:
-            sl, tp = entry + sl_dist, entry - tp_dist
-        return round(sl, digits), round(tp, digits), sl_pts, tp_pts
-
-    async def open_trade(self, side, symbol, lot, sl_points, tp_points):
+    async def open_trade(self, side, symbol):
         try:
-            if S.get("flip_signals"):
-                side = "SELL" if side == "BUY" else "BUY"
-                log(f"🔁 Flip enabled → side now {side}")
-
             spec = await self.load_spec(symbol)
-            lot = self.normalize_lot(lot, spec)
-            digits = spec["digits"]
+            lot = self.auto_lot(S["balance"] or S["equity"], spec, symbol)
+            S["lot"] = lot
             px = await self.conn.get_symbol_price(symbol)
             bid, ask = float(px["bid"]), float(px["ask"])
             spread = ask - bid
             th = self.thresholds(symbol)
             if spread > th["spread_max"]:
-                log(f"⛔ Spread too wide {spread:.5f} > {th['spread_max']} — skip entry")
+                log(f"⛔ Spread {spread:.5f} too wide — skip")
                 return False
 
             entry = ask if side == "BUY" else bid
-            attempts = [(sl_points, tp_points), (sl_points*1.5, tp_points*1.5), (sl_points*2.0, tp_points*2.2)]
-            last_err = None
+            sl, tp, sl_dist, tp_dist = self.build_sl_tp(side, entry, spec, symbol)
+            log(f"🧾 AUTO {side} {symbol} lot={lot} @ {entry} | SL={sl} TP={tp} | slDist={sl_dist:.5f} tpDist={tp_dist:.5f}")
 
-            for i, (slp, tpp) in enumerate(attempts, start=1):
-                sl, tp, usl, utp = self.build_sl_tp(side, entry, spec, slp, tpp)
-                log(f"🧾 Attempt {i}: {side} {symbol} lot={lot} @ {entry:.{digits}f} | SL={sl} ({usl:.0f}pts) | TP={tp} ({utp:.0f}pts)")
+            # one retry with wider stops if needed
+            for i, widen in enumerate((1.0, 1.6), start=1):
+                sl2, tp2 = sl, tp
+                if widen != 1.0:
+                    if side == "BUY":
+                        sl2 = entry - sl_dist * widen
+                        tp2 = entry + tp_dist * widen
+                    else:
+                        sl2 = entry + sl_dist * widen
+                        tp2 = entry - tp_dist * widen
+                    digits = spec["digits"]
+                    sl2, tp2 = round(sl2, digits), round(tp2, digits)
+                    log(f"↩️ Retry {i} wider SL/TP {sl2}/{tp2}")
                 try:
                     if side == "BUY":
-                        result = await self.conn.create_market_buy_order(symbol, lot, sl, tp)
+                        res = await self.conn.create_market_buy_order(symbol, lot, sl2, tp2)
                     else:
-                        result = await self.conn.create_market_sell_order(symbol, lot, sl, tp)
-                    log(f"✅ Order accepted: {result}")
+                        res = await self.conn.create_market_sell_order(symbol, lot, sl2, tp2)
+                    log(f"✅ Order accepted: {res}")
                     await asyncio.sleep(1.0)
                     await self.refresh()
                     mine = [p for p in S["positions"] if self.same_symbol(p["symbol"], symbol)]
                     if mine:
                         p = mine[-1]
                         log(f"🎉 OPENED #{p['id']} {p['type']} SL={p['sl']} TP={p['tp']}")
-                        S["last_action"] = f"OPENED #{p['id']} {p['type']}"
+                        S["last_action"] = f"OPENED #{p['id']}"
                         self.last_entry_ts = datetime.now(timezone.utc).timestamp()
-                        # reset setup after entry
                         self.impulse = None
                         self.pullback_seen = False
                         self.pullback_ext = None
                         S["phase"] = "IN_TRADE"
                         return True
-                    log("❌ No position after accept")
                 except Exception as e:
-                    last_err = e
-                    log(f"⚠️ Attempt {i} rejected: {e}")
-                    if any(k in str(e).lower() for k in ["stop", "invalid", "distance", "level", "s/l", "t/p"]):
+                    log(f"⚠️ Open reject: {e}")
+                    if "stop" in str(e).lower() or "invalid" in str(e).lower():
                         continue
                     break
-
-            log(f"❌ Open failed: {last_err}")
-            S["last_action"] = f"OPEN FAIL: {last_err}"
+            S["last_action"] = "OPEN FAIL"
             return False
         except Exception as e:
-            log(f"❌ open_trade crash: {e}")
+            log(f"❌ open crash: {e}")
             return False
 
-    def update_setup(self, mid, symbol):
-        """Impulse → pullback → continuation (anti-chase)."""
+    def setup_signal(self, mid, symbol):
         th = self.thresholds(symbol)
         now = datetime.now(timezone.utc).timestamp()
-
-        if len(self.prices) < 10:
+        if len(self.prices) < 12:
             S["phase"] = "WARMUP"
             return "WAITING", 0, "WAIT", "warmup"
 
-        # recent swings
-        window = self.prices[-10:]
         mom3 = self.prices[-1] - self.prices[-4]
         mom6 = self.prices[-1] - self.prices[-7]
-        hi = max(window)
-        lo = min(window)
+        trend = self.prices[-1] - self.prices[-12]
 
-        # timeout old impulse
-        if self.impulse and now - self.impulse_time > 45:
+        # expire impulse
+        if self.impulse and now - self.impulse_ts > 50:
             self.impulse = None
             self.pullback_seen = False
             self.pullback_ext = None
             S["phase"] = "SCAN"
 
-        # 1) detect fresh impulse (not entry yet)
         if self.impulse is None:
             S["phase"] = "SCAN"
-            if mom3 > th["impulse"] and mom6 > th["impulse"] * 0.7:
-                self.impulse = "UP"
-                self.impulse_price = mid
-                self.impulse_time = now
-                self.pullback_seen = False
-                self.pullback_ext = mid
-                log(f"📡 Impulse UP detected @ {mid:.5f} — waiting pullback (no chase)")
-                return "WAITING", 40, "IMPULSE UP", "impulseUP"
-            if mom3 < -th["impulse"] and mom6 < -th["impulse"] * 0.7:
-                self.impulse = "DOWN"
-                self.impulse_price = mid
-                self.impulse_time = now
-                self.pullback_seen = False
-                self.pullback_ext = mid
-                log(f"📡 Impulse DOWN detected @ {mid:.5f} — waiting pullback (no chase)")
-                return "WAITING", 40, "IMPULSE DOWN", "impulseDOWN"
-            return "WAITING", 10, "FLAT", "no-impulse"
+            # require trend alignment + impulse
+            if mom3 > th["impulse"] and mom6 > th["impulse"] * 0.6 and trend > 0:
+                self.impulse, self.impulse_price, self.impulse_ts = "UP", mid, now
+                self.pullback_seen, self.pullback_ext = False, mid
+                log(f"📡 Trend+Impulse UP @ {mid:.5f} — wait pullback")
+                return "WAITING", 45, "IMPULSE UP", "impulseUP"
+            if mom3 < -th["impulse"] and mom6 < -th["impulse"] * 0.6 and trend < 0:
+                self.impulse, self.impulse_price, self.impulse_ts = "DOWN", mid, now
+                self.pullback_seen, self.pullback_ext = False, mid
+                log(f"📡 Trend+Impulse DOWN @ {mid:.5f} — wait pullback")
+                return "WAITING", 45, "IMPULSE DOWN", "impulseDOWN"
+            return "WAITING", 15, "FLAT", "no-setup"
 
-        # 2) wait pullback against impulse
         if self.impulse == "UP":
-            # pullback = price dips
             if mid < self.impulse_price - th["pullback"]:
                 self.pullback_seen = True
                 self.pullback_ext = min(self.pullback_ext or mid, mid)
                 S["phase"] = "PULLBACK"
             if self.pullback_seen:
-                # continuation: turn back up from pullback low
                 rebound = mid - (self.pullback_ext or mid)
-                # avoid entering if already re-extended too far (chase protection)
-                ext_from_impulse = mid - self.impulse_price
-                if rebound >= th["continue"] and ext_from_impulse < th["impulse"] * 1.8:
-                    score = 70
+                if rebound >= th["continue"] and (mid - self.impulse_price) < th["impulse"] * 1.7:
+                    score = 72
                     if mid > self.prices[-2] > self.prices[-3]:
-                        score += 15
-                    if mom3 > 0:
-                        score += 10
-                    score = min(100, score)
+                        score += 12
+                    if trend > 0:
+                        score += 8
                     S["phase"] = "CONTINUE"
-                    return "BUY", score, "UP", "pullback-continue-UP"
-                return "WAITING", 55, "PULLBACK UP", "wait-continue-UP"
-            return "WAITING", 45, "IMPULSE UP", "wait-pullback-UP"
+                    return "BUY", min(100, score), "UP", "pb-continue-UP"
+                return "WAITING", 58, "PULLBACK UP", "wait-UP"
+            return "WAITING", 48, "IMPULSE UP", "wait-pb-UP"
 
         if self.impulse == "DOWN":
             if mid > self.impulse_price + th["pullback"]:
@@ -401,74 +477,87 @@ class Engine:
                 S["phase"] = "PULLBACK"
             if self.pullback_seen:
                 drop = (self.pullback_ext or mid) - mid
-                ext_from_impulse = self.impulse_price - mid
-                if drop >= th["continue"] and ext_from_impulse < th["impulse"] * 1.8:
-                    score = 70
+                if drop >= th["continue"] and (self.impulse_price - mid) < th["impulse"] * 1.7:
+                    score = 72
                     if mid < self.prices[-2] < self.prices[-3]:
-                        score += 15
-                    if mom3 < 0:
-                        score += 10
-                    score = min(100, score)
+                        score += 12
+                    if trend < 0:
+                        score += 8
                     S["phase"] = "CONTINUE"
-                    return "SELL", score, "DOWN", "pullback-continue-DOWN"
-                return "WAITING", 55, "PULLBACK DOWN", "wait-continue-DOWN"
-            return "WAITING", 45, "IMPULSE DOWN", "wait-pullback-DOWN"
+                    return "SELL", min(100, score), "DOWN", "pb-continue-DOWN"
+                return "WAITING", 58, "PULLBACK DOWN", "wait-DOWN"
+            return "WAITING", 48, "IMPULSE DOWN", "wait-pb-DOWN"
 
         return "WAITING", 0, "FLAT", "idle"
 
-    async def manage(self, symbol, side_now):
-        target = float(S["target_profit"])
+    async def manage_positions(self, symbol, side_now):
         for p in list(S["positions"]):
             if not self.same_symbol(p["symbol"], symbol):
                 continue
             pid = str(p["id"])
             pr = float(p["profit"])
+            open_px = float(p["open"])
+            cur = float(p["current"])
+            side = p["type"]
 
-            # hard USD bank
-            if pr >= target:
-                log(f"🎯 USD TP ${pr:.2f} >= ${target:.2f} → close #{pid}")
+            # bank solid green quickly on scalp-ish profits relative to balance
+            bal = max(S["balance"], 1)
+            soft_tp = max(0.40, bal * 0.004)   # ~0.4% equity soft bank
+            hard_tp = max(0.80, bal * 0.008)
+
+            if pr >= hard_tp:
+                log(f"🎯 Hard bank ${pr:.2f} → close #{pid}")
                 await self.close(pid)
                 continue
 
-            # break-even style early protect using reverse signal only if green
-            if pr > 0 and (
-                (p["type"] == "BUY" and side_now == "SELL") or
-                (p["type"] == "SELL" and side_now == "BUY")
-            ):
-                log(f"🔒 Protect profit ${pr:.2f} on reverse → close #{pid}")
+            # reverse protect when green
+            if pr > 0 and ((side == "BUY" and side_now == "SELL") or (side == "SELL" and side_now == "BUY")):
+                log(f"🔒 Reverse-in-profit ${pr:.2f} → close #{pid}")
                 await self.close(pid)
                 continue
 
-            # soft BE mark in logs / state (actual SL modify if supported)
-            if pr >= max(0.25, target * 0.35) and pid not in self.be_done:
-                self.be_done.add(pid)
-                log(f"📌 Profit cushion on #{pid} ${pr:.2f} — protection armed")
-                # try move SL near open if API supports
-                try:
-                    if hasattr(self.conn, "modify_position"):
-                        open_px = float(p["open"])
-                        # tiny lock-in offset
-                        spec = await self.load_spec(symbol)
-                        point = spec["point"]
-                        if p["type"] == "BUY":
-                            new_sl = open_px + 2 * point
+            # trailing / BE via modify if possible
+            try:
+                if hasattr(self.conn, "modify_position") and p["tp"]:
+                    spec = await self.load_spec(symbol)
+                    point = spec["point"]
+                    trail = self.trailed.get(pid, {"be": False, "trail": None})
+
+                    # break-even first
+                    if pr >= soft_tp * 0.6 and not trail.get("be"):
+                        if side == "BUY":
+                            new_sl = open_px + 3 * point
                         else:
-                            new_sl = open_px - 2 * point
-                        tp = float(p["tp"]) if p["tp"] else None
-                        if tp:
-                            await self.conn.modify_position(pid, new_sl, tp)
-                            log(f"✅ Moved SL near BE on #{pid}")
-                except Exception as e:
-                    log(f"BE modify note: {e}")
+                            new_sl = open_px - 3 * point
+                        await self.conn.modify_position(pid, round(new_sl, spec["digits"]), p["tp"])
+                        trail["be"] = True
+                        self.trailed[pid] = trail
+                        log(f"📌 BE SL set on #{pid}")
+
+                    # trail further as profit grows
+                    if pr >= soft_tp:
+                        if side == "BUY":
+                            new_sl = max(p["sl"] or 0, cur - max(self.atr_like() or 10*point, 8*point) * 0.6)
+                            if new_sl > (p["sl"] or 0) and new_sl < cur:
+                                await self.conn.modify_position(pid, round(new_sl, spec["digits"]), p["tp"])
+                                log(f"📈 Trail SL up #{pid} → {new_sl}")
+                        else:
+                            base = p["sl"] if p["sl"] else 1e18
+                            new_sl = min(base, cur + max(self.atr_like() or 10*point, 8*point) * 0.6)
+                            if (p["sl"] == 0 or new_sl < p["sl"]) and new_sl > cur:
+                                await self.conn.modify_position(pid, round(new_sl, spec["digits"]), p["tp"])
+                                log(f"📉 Trail SL down #{pid} → {new_sl}")
+            except Exception as e:
+                log(f"Trail note: {e}")
 
     async def run(self):
-        log(
-            f"🔥 RUN PULLBACK-CONTINUE | SL={S['sl_points']} TP={S['tp_points']} | "
-            f"USD={S['target_profit']} | score>={S['min_score']} | flip={S['flip_signals']}"
-        )
-        S["real_symbol"] = await self.resolve(S["symbol"])
+        log("🔥 AUTO-PILOT STARTED — self-managed entries, SL/TP, trailing, session filters")
+        # auto symbol if default
+        symbol = await self.pick_symbol()
+        S["symbol"] = symbol
+        S["real_symbol"] = await self.resolve(symbol)
         symbol = S["real_symbol"]
-        log(f"Trading symbol: {symbol}")
+        log(f"Auto symbol selected: {symbol}")
         await self.load_spec(symbol)
         try:
             await self.conn.subscribe_to_market_data(symbol)
@@ -477,15 +566,28 @@ class Engine:
 
         while S["running"] and S["connected"]:
             try:
+                # daily loss pause ~4%
+                if S["day_start_balance"] > 0 and S["day_pnl"] <= -(S["day_start_balance"] * 0.04):
+                    log("🛑 Daily loss limit reached — pausing new entries")
+                    await self.refresh()
+                    await asyncio.sleep(5)
+                    continue
+
+                session, sess_mult = self.session_now()
+                S["session"] = session
+                caution, why = self.news_caution()
+
                 px = await self.conn.get_symbol_price(symbol)
                 bid, ask = float(px["bid"]), float(px["ask"])
                 mid = (bid + ask) / 2.0
                 S["tick"] = {"bid": bid, "ask": ask}
                 self.prices.append(mid)
-                if len(self.prices) > 200:
+                if len(self.prices) > 250:
                     self.prices.pop(0)
 
-                side, score, label, reason = self.update_setup(mid, symbol)
+                side, score, label, reason = self.setup_signal(mid, symbol)
+                # session confidence adjust
+                score = int(max(0, min(100, score * sess_mult)))
                 S["score"] = score
                 S["direction"] = label
 
@@ -493,30 +595,37 @@ class Engine:
                 mine = [p for p in S["positions"] if self.same_symbol(p["symbol"], symbol)]
 
                 log(
-                    f"📊 {symbol} {bid:.2f}/{ask:.2f} phase={S['phase']} score={score}% "
-                    f"dir={label} reason={reason} openPos={len(mine)}"
+                    f"📊 {symbol} {bid:.2f}/{ask:.2f} session={session} phase={S['phase']} "
+                    f"score={score}% dir={label} reason={reason} open={len(mine)} dayPnL={S['day_pnl']}"
                 )
 
-                await self.manage(symbol, side)
+                await self.manage_positions(symbol, side)
 
                 now = datetime.now(timezone.utc).timestamp()
-                if len(mine) >= S["max_trades"]:
+                allow = True
+                if caution:
+                    allow = False
+                    log(f"⏸️ Caution window ({why}) — no new entries")
+                if session == "OFFPEAK" and score < 85:
+                    allow = False
+                if len(mine) >= 1:
+                    allow = False
                     p = mine[0]
-                    log(f"⏳ Manage #{p['id']} P/L=${p['profit']:.2f} SL={p['sl']} TP={p['tp']}")
-                elif side in ("BUY", "SELL") and score >= int(S["min_score"]) and now - self.last_entry_ts > 12:
-                    log(f"✅ HIGH-QUALITY ENTRY {side} ({score}%) after pullback")
-                    await self.open_trade(side, symbol, S["lot"], S["sl_points"], S["tp_points"])
-                else:
-                    need = int(S["min_score"])
-                    log(f"… no entry yet | need>={need}% best={score}% phase={S['phase']}")
+                    log(f"⏳ Managing #{p['id']} P/L=${p['profit']:.2f} SL={p['sl']} TP={p['tp']}")
+
+                if allow and side in ("BUY", "SELL") and score >= 70 and now - self.last_entry_ts > 15:
+                    log(f"✅ AUTO ENTRY {side} score={score}%")
+                    await self.open_trade(side, symbol)
+                elif not mine:
+                    log("… scanning for pullback-continuation setup")
 
             except Exception as e:
                 log(f"Loop error: {e}")
             await asyncio.sleep(0.9)
 
-        log("Stopped")
+        log("Auto-Pilot stopped")
 
-engine = Engine()
+engine = AutoPilot()
 
 HTML = r"""
 <!DOCTYPE html>
@@ -527,7 +636,7 @@ HTML = r"""
 <meta name="theme-color" content="#070b12">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <link rel="manifest" href="/manifest.json">
-<title>MK Pullback Bot</title>
+<title>MK Auto-Pilot</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
 body{margin:0;background:#070b12;color:#c9d1d9;font-family:system-ui,sans-serif;padding-bottom:80px}
@@ -546,33 +655,36 @@ label{font-size:11px;color:#8b949e}
 .form-control,.form-select{background:#0b1220!important;border-color:#243247!important;color:#e6edf3!important}
 .btn-go{background:#238636;border:0;color:#fff;font-weight:900;border-radius:12px;padding:12px;width:100%}
 .btn-stop{background:#da3633;border:0;color:#fff;font-weight:900;border-radius:12px;padding:12px;width:100%}
-.log{height:220px;overflow:auto;background:#05080f;border:1px solid #243247;border-radius:12px;padding:10px;font:11px monospace;color:#3fb950}
+.log{height:240px;overflow:auto;background:#05080f;border:1px solid #243247;border-radius:12px;padding:10px;font:11px monospace;color:#3fb950}
 #fab{position:fixed;right:14px;bottom:18px;width:56px;height:56px;border-radius:50%;background:#238636;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:22px}
-.hint{font-size:11px;color:#8b949e;margin-top:8px}
+.hint{font-size:11px;color:#8b949e}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="d-flex justify-content-between align-items-center">
-    <div class="brand">⚡ MK Pullback Engine</div>
+    <div class="brand">🤖 MK Auto-Pilot</div>
     <div id="st" class="pill off">● Offline</div>
   </div>
   <div class="grid">
     <div class="m"><small>Bid/Ask</small><b id="px">0/0</b></div>
     <div class="m"><small>Balance</small><b id="bal">$0</b></div>
-    <div class="m"><small>Floating</small><b id="pl">$0</b></div>
+    <div class="m"><small>Day P/L</small><b id="pl">$0</b></div>
     <div class="m"><small>Phase/Score</small><b id="dir">SCAN 0%</b></div>
   </div>
   <div class="tabs">
     <button class="tab active" data-t="live">Live</button>
-    <button class="tab" data-t="set">Settings</button>
     <button class="tab" data-t="conn">Connect</button>
   </div>
 
   <div id="panel-live">
     <div class="card">
       <div class="d-flex justify-content-between align-items-center mb-2">
-        <div><b style="color:#fff">Positions</b><div class="hint" id="last">Last: —</div></div>
+        <div>
+          <b style="color:#fff">Fully Automatic</b>
+          <div class="hint" id="meta">Session: — | Lot: —</div>
+          <div class="hint" id="last">Last: —</div>
+        </div>
         <div style="display:flex;gap:8px;width:170px">
           <button id="btnStart" class="btn-go" style="padding:10px" disabled>RUN</button>
           <button id="btnStop" class="btn-stop" style="padding:10px" disabled>STOP</button>
@@ -582,30 +694,9 @@ label{font-size:11px;color:#8b949e}
         <thead><tr><th>Sym</th><th>Side</th><th>P/L</th><th>SL</th><th>TP</th><th></th></tr></thead>
         <tbody id="pos"><tr><td colspan="6" class="text-center text-muted">No trades</td></tr></tbody>
       </table>
+      <p class="hint mt-2 mb-0">No bot can guarantee no losses. This auto-pilot uses trend+pullback entries, auto lot, SL/TP, trailing, session/news caution, and daily loss pause.</p>
     </div>
     <div class="card"><div style="color:#fff;font-weight:800;margin-bottom:6px">Live Log</div><div id="log" class="log"></div></div>
-  </div>
-
-  <div id="panel-set" style="display:none">
-    <div class="card">
-      <label>Symbol</label>
-      <select id="sym" class="form-select mb-2">
-        <option>XAUUSD</option><option>BTCUSD</option><option>ETHUSD</option><option>EURUSD</option>
-      </select>
-      <div class="row g-2">
-        <div class="col-6"><label>SL points</label><input id="sl" class="form-control" type="number" value="250"></div>
-        <div class="col-6"><label>TP points</label><input id="tp" class="form-control" type="number" value="500"></div>
-        <div class="col-6"><label>USD close target</label><input id="target" class="form-control" type="number" value="0.8" step="0.1"></div>
-        <div class="col-6"><label>Min score %</label><input id="score" class="form-control" type="number" value="60"></div>
-        <div class="col-6"><label>Lot</label><input id="lot" class="form-control" type="number" value="0.01" step="0.01"></div>
-        <div class="col-6"><label>Max trades</label><input id="max" class="form-control" type="number" value="1"></div>
-      </div>
-      <div class="form-check mt-3">
-        <input class="form-check-input" type="checkbox" id="flip">
-        <label class="form-check-label" for="flip">Flip signals (only if entries still feel inverted)</label>
-      </div>
-      <p class="hint">This version waits for pullback after impulse. It will trade less often, but should stop the “buy top / sell bottom” SL loop. TP every trade is impossible — better entries + TP>SL is the real fix.</p>
-    </div>
   </div>
 
   <div id="panel-conn" style="display:none">
@@ -614,7 +705,7 @@ label{font-size:11px;color:#8b949e}
       <input id="token" type="password" class="form-control mb-2">
       <label>Method</label>
       <select id="method" class="form-select mb-2">
-        <option value="id">Account ID</option>
+        <option value="id">Account ID (best)</option>
         <option value="login">Login + Password + Server</option>
       </select>
       <div id="box-id"><label>Account ID</label><input id="accid" class="form-control mb-2"></div>
@@ -635,7 +726,6 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); b.classList.add('active');
   const t=b.dataset.t;
   $('panel-live').style.display=t==='live'?'block':'none';
-  $('panel-set').style.display=t==='set'?'block':'none';
   $('panel-conn').style.display=t==='conn'?'block':'none';
 });
 $('method').onchange=()=>{
@@ -647,8 +737,10 @@ async function refresh(){
   $('st').textContent='● '+d.status; $('st').className='pill '+(d.connected?'on':'off');
   $('px').textContent=d.tick.bid.toFixed(2)+' / '+d.tick.ask.toFixed(2);
   $('bal').textContent='$'+d.balance.toFixed(2);
-  $('pl').textContent=(d.profit>=0?'+':'')+d.profit.toFixed(2);
+  $('pl').textContent=(d.day_pnl>=0?'+':'')+d.day_pnl.toFixed(2);
+  $('pl').style.color=d.day_pnl>=0?'#3fb950':'#f85149';
   $('dir').textContent=(d.phase||'SCAN')+' '+(d.score||0)+'%';
+  $('meta').textContent=`Session: ${d.session||'—'} | Lot: ${d.lot||'—'} | Symbol: ${d.real_symbol||d.symbol||'—'}`;
   $('last').textContent='Last: '+(d.last_action||'—');
   $('log').innerHTML=(d.logs||[]).join('<br>'); $('log').scrollTop=1e9;
   let h='';
@@ -667,20 +759,9 @@ async function doConnect(){
   const d=await(await fetch('/api/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
   alert(d.success?'✅ Connected':('❌ '+d.message));
 }
-async function startBot(){
-  await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-    symbol:$('sym').value,
-    sl_points:parseInt($('sl').value),
-    tp_points:parseInt($('tp').value),
-    target_profit:parseFloat($('target').value),
-    min_score:parseInt($('score').value),
-    lot:parseFloat($('lot').value),
-    max_trades:parseInt($('max').value),
-    flip_signals:$('flip').checked
-  })});
-}
-async function stopBot(){await fetch('/api/stop',{method:'POST'});}
-async function closePos(id){if(confirm('Close?'))await fetch('/api/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});}
+async function startBot(){ await fetch('/api/start',{method:'POST'}); }
+async function stopBot(){ await fetch('/api/stop',{method:'POST'}); }
+async function closePos(id){ if(confirm('Close?')) await fetch('/api/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); }
 $('btnConnect').onclick=doConnect; $('btnStart').onclick=startBot; $('btnStop').onclick=stopBot;
 $('fab').onclick=()=>window.scrollTo({top:0,behavior:'smooth'});
 setInterval(refresh,1000); refresh();
@@ -696,7 +777,7 @@ def home():
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
-        "name": "MK Pullback Bot", "short_name": "MK", "start_url": "/", "display": "standalone",
+        "name": "MK Auto-Pilot", "short_name": "MK Auto", "start_url": "/", "display": "standalone",
         "background_color": "#070b12", "theme_color": "#070b12",
         "icons": [{"src": "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/26a1.png", "sizes": "192x192", "type": "image/png"}]
     })
@@ -731,22 +812,14 @@ def api_connect():
 def api_start():
     if not S["connected"]:
         return jsonify(ok=False, message="Connect first")
-    d = request.json or {}
-    S["symbol"] = (d.get("symbol") or "XAUUSD").upper()
-    S["sl_points"] = int(d.get("sl_points", 250))
-    S["tp_points"] = int(d.get("tp_points", 500))
-    S["target_profit"] = float(d.get("target_profit", 0.8))
-    S["min_score"] = int(d.get("min_score", 60))
-    S["lot"] = float(d.get("lot", 0.01))
-    S["max_trades"] = int(d.get("max_trades", 1))
-    S["flip_signals"] = bool(d.get("flip_signals", False))
     S["running"] = True
-    # reset setup state
+    if not S.get("day_start_balance"):
+        S["day_start_balance"] = S["balance"] or S["equity"]
     engine.impulse = None
     engine.pullback_seen = False
     engine.pullback_ext = None
     engine.prices = []
-    engine.be_done = set()
+    engine.trailed = {}
     asyncio.run_coroutine_threadsafe(engine.run(), _loop)
     return jsonify(ok=True)
 
