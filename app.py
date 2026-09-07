@@ -3,11 +3,10 @@ import asyncio
 import threading
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, jsonify
 from metaapi_cloud_sdk import MetaApi
-import pandas as pd
-import numpy as np
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
@@ -41,24 +40,16 @@ bot_state = {
     "symbol": "BTCUSD",
     "actual_symbol": "BTCUSD",
     "timeframe": "1m",
-    "macro_timeframe": "15m",
     "lot_size": 0.01,
     "max_trades": 1,
-    "min_profit_target_usd": 1.00,    # Target Profit in USD to close & bank
-    "min_confidence_score": 80,       # Minimum 80% accuracy score required to enter
-    "stop_loss_pips": 1500,
-    "take_profit_pips": 3000,
+    "min_profit_target_usd": 0.30,  # Target profit in USD to close instantly
+    "stop_loss_pips": 1000,
+    "take_profit_pips": 2000,
     "open_positions": [],
     "live_tick": {"bid": 0.0, "ask": 0.0, "spread": 0.0, "time": ""},
-    "market_analysis": {
-        "price": 0.0,
-        "macro_trend": "ANALYZING",
-        "rsi": 0.0,
-        "macd_hist": 0.0,
-        "confidence_score": 0,
-        "signal": "WAITING"
-    },
-    "logs": ["High-Accuracy Multi-Confluence Engine Ready. Connect MT4/MT5 account."]
+    "tick_acceleration": 0.0,
+    "micro_signal": "WAITING",
+    "logs": ["Sub-Second Acceleration Scalper Ready. Connect MT4/MT5 to begin."]
 }
 
 def add_log(msg):
@@ -69,32 +60,23 @@ def add_log(msg):
         bot_state["logs"].pop(0)
     logging.info(msg)
 
-# ================= TECHNICAL INDICATORS =================
-def calculate_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-def calculate_macd(series, fast=12, slow=26, signal=9):
-    ema_fast = calculate_ema(series, fast)
-    ema_slow = calculate_ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = calculate_ema(macd_line, signal)
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-# ================= METAAPI HIGH-ACCURACY ENGINE =================
-class HighAccuracyEngine:
+# ================= METAAPI ULTRA-FAST SCALPER ENGINE =================
+class UltraScalperEngine:
     def __init__(self):
         self.api = None
         self.account = None
         self.connection = None
+        self.price_history = []
         self.specs_cache = {}
+
+    def sanitize_server_name(self, server_name):
+        """ Auto-corrects server name typos like Exness-MT5TriaI9 -> Exness-MT5Trial9 """
+        if not server_name:
+            return ""
+        cleaned = server_name.strip()
+        cleaned = re.sub(r'TriaI', 'Trial', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'Triai', 'Trial', cleaned, flags=re.IGNORECASE)
+        return cleaned
 
     async def connect_with_account_id(self, token, account_id):
         try:
@@ -112,7 +94,8 @@ class HighAccuracyEngine:
 
     async def connect_with_credentials(self, token, login, password, server, platform, region):
         try:
-            add_log(f"Connecting to Broker Server: {server} | Login: {login}")
+            clean_server = self.sanitize_server_name(server)
+            add_log(f"Connecting to Broker Server: '{clean_server}' | Login: {login}")
             self.api = MetaApi(token)
 
             try:
@@ -122,7 +105,7 @@ class HighAccuracyEngine:
 
             existing = None
             for acc in accounts:
-                if str(acc.login) == str(login) and server.lower() in str(acc.server).lower():
+                if str(acc.login) == str(login) and clean_server.lower() in str(acc.server).lower():
                     existing = acc
                     break
 
@@ -130,11 +113,11 @@ class HighAccuracyEngine:
                 self.account = existing
             else:
                 payload = {
-                    "name": f"AccurateBot-{login}",
+                    "name": f"TickScalper-{login}",
                     "type": "cloud",
                     "login": str(login),
                     "password": str(password),
-                    "server": str(server),
+                    "server": str(clean_server),
                     "platform": "mt5" if "5" in str(platform) else "mt4",
                     "magic": 998877
                 }
@@ -156,10 +139,10 @@ class HighAccuracyEngine:
         bot_state["login"] = str(getattr(self.account, "login", "Connected"))
 
         if self.account.state != "DEPLOYED":
-            add_log("Deploying broker terminal container...")
+            add_log("Deploying cloud terminal container...")
             await self.account.deploy()
 
-        add_log("Synchronizing live price stream...")
+        add_log("Synchronizing real-time price stream...")
         await self.account.wait_connected()
 
         self.connection = self.account.get_rpc_connection()
@@ -170,7 +153,7 @@ class HighAccuracyEngine:
         bot_state["is_connected"] = True
         bot_state["status_msg"] = f"Online ({bot_state['account_type']})"
         bot_state["last_error"] = ""
-        add_log("⚡ SUCCESS! High-Accuracy Engine Connected & Synchronized with MT4/MT5.")
+        add_log("⚡ SUCCESS! High-Speed Scalper Connected & Stream Active.")
         return True, "Connected successfully"
 
     async def get_symbol_spec_cached(self, symbol):
@@ -232,51 +215,27 @@ class HighAccuracyEngine:
         except Exception:
             return requested_symbol
 
-    async def fetch_candles(self, symbol, timeframe, count=60):
-        try:
-            start_time = datetime.now(timezone.utc) - timedelta(days=2)
-            meta_tf = timeframe if timeframe in ['1m','5m','15m','30m','1h'] else '1m'
-            
-            candles = None
-            if hasattr(self.api, 'historical_market_data_client'):
-                candles = await self.api.historical_market_data_client.get_historical_candles(
-                    self.account.server, symbol, meta_tf, start_time, count
-                )
-
-            if not candles or len(candles) == 0:
-                tick = await self.connection.get_symbol_price(symbol)
-                mid = (tick['ask'] + tick['bid']) / 2.0
-                return pd.DataFrame({'close': [mid]*30, 'high': [mid*1.0001]*30, 'low': [mid*0.9999]*30})
-
-            df = pd.DataFrame(candles)
-            for col in ["open", "high", "low", "close"]:
-                if col in df.columns:
-                    df[col] = df[col].astype(float)
-            return df
-        except Exception:
-            return None
-
-    async def close_position_robust(self, position_id):
+    async def close_position_instant(self, position_id):
         pos_id_str = str(position_id)
-        add_log(f"Closing Trade Ticket #{pos_id_str}...")
+        add_log(f"⚡ INSTANT CLOSE: Sending close command for Trade Ticket #{pos_id_str}...")
         try:
             await self.connection.close_position(pos_id_str)
-            add_log(f"✅ Trade #{pos_id_str} CLOSED successfully in Profit!")
+            add_log(f"💰 Trade #{pos_id_str} CLOSED successfully in Profit!")
             await self.update_account_info()
             return True
         except Exception:
             try:
                 if pos_id_str.isdigit():
                     await self.connection.close_position(int(pos_id_str))
-                    add_log(f"✅ Trade #{pos_id_str} CLOSED successfully in Profit!")
+                    add_log(f"💰 Trade #{pos_id_str} CLOSED successfully in Profit!")
                     await self.update_account_info()
                     return True
             except Exception as e:
                 add_log(f"❌ Close Error: {e}")
         return False
 
-    async def auto_manage_and_protect_profit(self, symbol, current_signal):
-        """ Profit Lock Engine: Closes trade when Target Profit is met or when trend shifts """
+    async def check_and_auto_close_profits(self, symbol):
+        """ Sub-Second Profit Lock: Monitors floating P/L 4 times per second """
         try:
             positions = bot_state["open_positions"]
             target = bot_state["min_profit_target_usd"]
@@ -284,19 +243,10 @@ class HighAccuracyEngine:
             for pos in positions:
                 if pos["symbol"].replace("T", "") in symbol.replace("T", "") or symbol.replace("T", "") in pos["symbol"].replace("T", ""):
                     profit = pos["profit"]
-                    pos_type = pos["type"]
-
-                    # Rule 1: Target Profit Hit ($ USD) -> Close & Bank Profit
                     if profit >= target:
-                        add_log(f"🎯 TARGET PROFIT REACHED (+${profit:.2f} >= ${target:.2f})! Closing Trade #{pos['id']} on MT5...")
-                        await self.close_position_robust(pos["id"])
-
-                    # Rule 2: Partial Profit Lock (Locking in profit if 60% of target hit & structure weakens)
-                    elif profit >= (target * 0.60) and ((pos_type == "BUY" and current_signal == "SELL") or (pos_type == "SELL" and current_signal == "BUY")):
-                        add_log(f"🔒 LOCKING PROFIT (+${profit:.2f})! Trend weakening, closing Trade #{pos['id']} to secure gains...")
-                        await self.close_position_robust(pos["id"])
-
-        except Exception as e:
+                        add_log(f"🎯 PROFIT TARGET HIT (+${profit:.2f} >= ${target:.2f})! Banking profit now...")
+                        await self.close_position_instant(pos["id"])
+        except Exception:
             pass
 
     async def execute_trade(self, action, symbol, lot, sl_pips, tp_pips):
@@ -313,20 +263,20 @@ class HighAccuracyEngine:
             sl = entry - (sl_pips * pip_scale) if action == "BUY" else entry + (sl_pips * pip_scale)
             tp = entry + (tp_pips * pip_scale) if action == "BUY" else entry - (tp_pips * pip_scale)
 
-            add_log(f"⚡ HIGH-ACCURACY EXECUTION: Opening {action} on {symbol} | Lot: {lot} @ Entry: {entry:.2f}")
+            add_log(f"⚡ PRE-MOVE ENTRY: Opening {action} on {symbol} | Lot: {lot} @ Entry: {entry:.2f}")
 
             if action == "BUY":
                 res = await self.connection.create_market_buy_order(symbol, lot, round(sl, digits), round(tp, digits))
             else:
                 res = await self.connection.create_market_sell_order(symbol, lot, round(sl, digits), round(tp, digits))
 
-            add_log(f"✅ TRADE EXECUTED ON MT5! Order ID: {res.get('stringCode', 'CONFIRMED')}")
+            add_log(f"✅ EXECUTED INSTANTLY ON BROKER! Ticket: {res.get('stringCode', 'CONFIRMED')}")
             await self.update_account_info()
         except Exception as e:
             add_log(f"❌ Execution Error: {e}")
 
-    async def run_high_accuracy_loop(self):
-        add_log("🚀 HIGH-ACCURACY CONFLUENCE ENGINE ACTIVE!")
+    async def run_sub_second_scalper_loop(self):
+        add_log("🚀 SUB-SECOND ACCELERATION ENGINE ACTIVE (250ms Loop)")
         bot_state["actual_symbol"] = await self.resolve_symbol(bot_state["symbol"])
         symbol = bot_state["actual_symbol"]
 
@@ -337,7 +287,7 @@ class HighAccuracyEngine:
 
         while bot_state["is_running"] and bot_state["is_connected"]:
             try:
-                # 1. Real-time Market Prices
+                # 1. Sample Live Tick Price (Every 250ms)
                 tick = await self.connection.get_symbol_price(symbol)
                 bid, ask = float(tick["bid"]), float(tick["ask"])
                 mid_price = (bid + ask) / 2.0
@@ -348,91 +298,60 @@ class HighAccuracyEngine:
                     "time": datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 }
 
-                # 2. Multi-Timeframe Analysis
-                # Higher Timeframe (M15) for Macro Direction
-                df_macro = await self.fetch_candles(symbol, bot_state["macro_timeframe"], count=50)
-                macro_trend = "NEUTRAL"
-                if df_macro is not None and len(df_macro) >= 20:
-                    macro_ema = calculate_ema(df_macro["close"], 50)
-                    if df_macro["close"].iloc[-1] > macro_ema.iloc[-1]:
-                        macro_trend = "BULLISH 🟢"
-                    else:
-                        macro_trend = "BEARISH 🔴"
+                # 2. Buffer Sub-Second Ticks
+                self.price_history.append(mid_price)
+                if len(self.price_history) > 8:
+                    self.price_history.pop(0)
 
-                # Entry Timeframe (M1) for Confluence Scoring
-                df_entry = await self.fetch_candles(symbol, bot_state["timeframe"], count=50)
-                
+                # 3. Calculate Tick Acceleration (Rate of Change of Speed)
                 signal = "WAITING"
-                confidence_score = 0
+                accel = 0.0
 
-                if df_entry is not None and len(df_entry) >= 20:
-                    df_entry["ema_f"] = calculate_ema(df_entry["close"], 9)
-                    df_entry["ema_s"] = calculate_ema(df_entry["close"], 21)
-                    df_entry["rsi"] = calculate_rsi(df_entry["close"], 14)
-                    _, _, df_entry["macd_hist"] = calculate_macd(df_entry["close"])
+                if len(self.price_history) >= 4:
+                    # Velocity 1: Change between last two ticks
+                    v1 = self.price_history[-1] - self.price_history[-2]
+                    # Velocity 2: Change between previous two ticks
+                    v2 = self.price_history[-2] - self.price_history[-3]
+                    # Acceleration: Difference in velocities
+                    accel = round(v1 - v2, 3)
+                    bot_state["tick_acceleration"] = accel
 
-                    ema_f = df_entry["ema_f"].iloc[-1]
-                    ema_s = df_entry["ema_s"].iloc[-1]
-                    rsi = df_entry["rsi"].iloc[-1]
-                    macd_h = df_entry["macd_hist"].iloc[-1]
+                    # Trigger Signal on Positive/Negative Acceleration Spikes
+                    threshold = 0.50 if "BTC" in symbol else 0.0001
+                    if v1 > 0 and accel > threshold:
+                        signal = "BUY"
+                        bot_state["micro_signal"] = "BULLISH SURGE 🚀"
+                    elif v1 < 0 and accel < -threshold:
+                        signal = "SELL"
+                        bot_state["micro_signal"] = "BEARISH DROP 📉"
+                    else:
+                        bot_state["micro_signal"] = "WAITING FOR MOVE"
 
-                    # BUY Confluence Scoring
-                    if "BULLISH" in macro_trend:
-                        score_buy = 30  # Macro Alignment (+30)
-                        if ema_f > ema_s: score_buy += 25  # EMA Crossover (+25)
-                        if 50 < rsi < 70: score_buy += 25  # RSI Momentum (+25)
-                        if macd_h > 0: score_buy += 20     # MACD Histogram (+20)
-                        
-                        if score_buy >= bot_state["min_confidence_score"]:
-                            signal = "BUY"
-                            confidence_score = score_buy
+                # 4. Instant Profit Manager Check (Runs 4x a second)
+                await self.check_and_auto_close_profits(symbol)
 
-                    # SELL Confluence Scoring
-                    elif "BEARISH" in macro_trend:
-                        score_sell = 30  # Macro Alignment (+30)
-                        if ema_f < ema_s: score_sell += 25  # EMA Crossover (+25)
-                        if 30 < rsi < 50: score_sell += 25  # RSI Momentum (+25)
-                        if macd_h < 0: score_sell += 20     # MACD Histogram (+20)
-
-                        if score_sell >= bot_state["min_confidence_score"]:
-                            signal = "SELL"
-                            confidence_score = score_sell
-
-                    bot_state["market_analysis"] = {
-                        "price": round(mid_price, 2),
-                        "macro_trend": macro_trend,
-                        "rsi": round(rsi, 1),
-                        "macd_hist": round(macd_h, 3),
-                        "confidence_score": confidence_score if signal != "WAITING" else max(score_buy if 'score_buy' in locals() else 0, score_sell if 'score_sell' in locals() else 0),
-                        "signal": signal
-                    }
-
-                add_log(f"📊 [{symbol}] Macro: {macro_trend} | Confluence Score: {bot_state['market_analysis']['confidence_score']}% → Signal: {signal}")
-
-                # 3. Manage Open Trades & Profit Lock
-                await self.auto_manage_and_protect_profit(symbol, signal)
-
-                # 4. Open Trade ONLY if Confluence Score Threshold met
+                # 5. Open Instant Trade Before Price Surge Finishes
                 matching_positions = [
                     p for p in bot_state["open_positions"] 
                     if p["symbol"].replace("T", "") in symbol.replace("T", "") or symbol.replace("T", "") in p["symbol"].replace("T", "")
                 ]
 
                 if len(matching_positions) < bot_state["max_trades"] and signal in ["BUY", "SELL"]:
-                    add_log(f"🎯 ACCURATE ENTRY MATCHED! Score: {confidence_score}% >= {bot_state['min_confidence_score']}% Threshold. Opening {signal} Trade...")
+                    add_log(f"🔥 TICK SURGE DETECTED ({bot_state['micro_signal']})! Accel: {accel}. Opening Trade...")
                     await self.execute_trade(
                         signal, symbol, bot_state["lot_size"],
                         bot_state["stop_loss_pips"], bot_state["take_profit_pips"]
                     )
 
             except Exception as e:
-                add_log(f"Analysis Engine Note: {e}")
+                pass
 
-            await asyncio.sleep(1.5)
+            # Loop every 250 milliseconds (Sub-Second Execution)
+            await asyncio.sleep(0.25)
 
-        add_log("Trading loop stopped.")
+        add_log("Sub-second scalper loop stopped.")
 
-engine = HighAccuracyEngine()
+engine = UltraScalperEngine()
 
 # ================= EMBEDDED DASHBOARD UI =================
 HTML_TEMPLATE = r"""
@@ -441,7 +360,7 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cloud Automated High-Accuracy Scalper Bot Overlay</title>
+<title>Cloud Sub-Second Scalper Overlay Bot</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
 <style>
@@ -468,7 +387,7 @@ body { background-color: #06080d; color: #adbac7; font-family: system-ui, -apple
     <!-- TOP HEADER -->
     <div class="d-flex justify-content-between align-items-center mb-3 card p-3">
         <div>
-            <h5 class="m-0 text-white font-weight-bold">🎯 High-Accuracy MT4/MT5 Automated Bot</h5>
+            <h5 class="m-0 text-white font-weight-bold">⚡ MT4/MT5 Sub-Second Acceleration Scalper</h5>
             <small class="text-muted" id="accountSub">Not Connected</small>
         </div>
         <div>
@@ -498,8 +417,8 @@ body { background-color: #06080d; color: #adbac7; font-family: system-ui, -apple
         </div>
         <div class="col-6 col-md-3">
             <div class="card p-2 text-center">
-                <span class="metric-title">Accuracy Score</span>
-                <div class="metric-value text-warning" id="scoreVal">0% (WAITING)</div>
+                <span class="metric-title">Pre-Move Momentum</span>
+                <div class="metric-value text-warning" id="surgeVal">WAITING FOR MOVE</div>
             </div>
         </div>
     </div>
@@ -507,7 +426,7 @@ body { background-color: #06080d; color: #adbac7; font-family: system-ui, -apple
     <!-- NAVIGATION TABS -->
     <ul class="nav nav-pills mb-3">
         <li class="nav-item"><button class="nav-link active" data-tab="live">📊 Live Terminal & Chart</button></li>
-        <li class="nav-item"><button class="nav-link" data-tab="strategy">⚙️ Settings & Profit Target</button></li>
+        <li class="nav-item"><button class="nav-link" data-tab="strategy">⚙️ Settings & Target Profit</button></li>
         <li class="nav-item"><button class="nav-link" data-tab="connect">🔗 Broker Login</button></li>
     </ul>
 
@@ -549,7 +468,7 @@ body { background-color: #06080d; color: #adbac7; font-family: system-ui, -apple
     <!-- TAB 2: SETTINGS -->
     <div id="tab-strategy" class="tab-pane" style="display:none;">
         <div class="card p-3">
-            <h6 class="text-white mb-3">High-Accuracy Trading Settings</h6>
+            <h6 class="text-white mb-3">Instant Profit Target & Risk Controls</h6>
             <div class="row g-3">
                 <div class="col-md-6">
                     <label class="form-label">Symbol Select</label>
@@ -567,24 +486,16 @@ body { background-color: #06080d; color: #adbac7; font-family: system-ui, -apple
                     </select>
                 </div>
                 <div class="col-md-6">
-                    <label class="form-label">Entry Timeframe</label>
+                    <label class="form-label">Execution Timeframe</label>
                     <select id="tfSelect" class="form-select" onchange="updateTradingViewChart()">
-                        <option value="1m" selected>M1 (High Accuracy Scalp)</option>
+                        <option value="1m" selected>M1 (Sub-Second Scalp)</option>
                         <option value="5m">M5</option>
                         <option value="15m">M15</option>
                     </select>
                 </div>
                 <div class="col-6 col-md-3">
-                    <label class="form-label">Target Profit ($ USD to Bank)</label>
-                    <input type="number" id="targetProfitInput" class="form-control" value="1.00" step="0.50">
-                </div>
-                <div class="col-6 col-md-3">
-                    <label class="form-label">Minimum Accuracy Threshold</label>
-                    <select id="scoreThresholdInput" class="form-select">
-                        <option value="75">75% (More Trades)</option>
-                        <option value="80" selected>80% (Recommended High Win-Rate)</option>
-                        <option value="90">90% (Strict / Max Accuracy)</option>
-                    </select>
+                    <label class="form-label">Target Profit ($ USD to Close)</label>
+                    <input type="number" id="targetProfitInput" class="form-control" value="0.30" step="0.10">
                 </div>
                 <div class="col-6 col-md-3">
                     <label class="form-label">Lot Size</label>
@@ -593,6 +504,10 @@ body { background-color: #06080d; color: #adbac7; font-family: system-ui, -apple
                 <div class="col-6 col-md-3">
                     <label class="form-label">Max Active Trades</label>
                     <input type="number" id="maxTradesInput" class="form-control" value="1">
+                </div>
+                <div class="col-6 col-md-3">
+                    <label class="form-label">Stop Loss (Points)</label>
+                    <input type="number" id="slInput" class="form-control" value="1000">
                 </div>
             </div>
         </div>
@@ -650,7 +565,7 @@ body { background-color: #06080d; color: #adbac7; font-family: system-ui, -apple
 
     <!-- LOGS CONSOLE -->
     <div class="card p-3">
-        <h6 class="text-white mb-2">Live Automated Execution Console</h6>
+        <h6 class="text-white mb-2">Sub-Second Scalper Console</h6>
         <div id="logBox" class="log-box"></div>
     </div>
 
@@ -720,10 +635,7 @@ async function refreshUI() {
         }
 
         document.getElementById('balVal').textContent = '$' + d.balance.toFixed(2) + ' / $' + d.equity.toFixed(2);
-        
-        if(d.market_analysis) {
-            document.getElementById('scoreVal').textContent = (d.market_analysis.confidence_score || 0) + '% (' + (d.market_analysis.signal || 'WAITING') + ')';
-        }
+        document.getElementById('surgeVal').textContent = d.micro_signal || 'WAITING FOR MOVE';
 
         const plElem = document.getElementById('plVal');
         plElem.textContent = (d.profit >= 0 ? '+$' : '-$') + Math.abs(d.profit).toFixed(2);
@@ -800,9 +712,8 @@ async function startBot() {
         lot_size: parseFloat(document.getElementById('lotInput').value),
         max_trades: parseInt(document.getElementById('maxTradesInput').value),
         min_profit_target_usd: parseFloat(document.getElementById('targetProfitInput').value),
-        min_confidence_score: parseInt(document.getElementById('scoreThresholdInput').value),
-        stop_loss_pips: 1500,
-        take_profit_pips: 3000
+        stop_loss_pips: parseInt(document.getElementById('slInput').value),
+        take_profit_pips: 2000
     };
     await fetch('/api/start', {
         method: 'POST',
@@ -827,7 +738,8 @@ async function closePosition(posId) {
 
 window.onload = () => {
     initTradingViewChart("BTCUSD", "1m");
-    setInterval(refreshUI, 1000);
+    // Dashboard updates every 300ms for live tracking
+    setInterval(refreshUI, 300);
 };
 </script>
 </body>
@@ -887,19 +799,18 @@ def api_start():
         "timeframe": data.get("timeframe", "1m"),
         "lot_size": float(data.get("lot_size", 0.01)),
         "max_trades": int(data.get("max_trades", 1)),
-        "min_profit_target_usd": float(data.get("min_profit_target_usd", 1.00)),
-        "min_confidence_score": int(data.get("min_confidence_score", 80)),
-        "stop_loss_pips": 1500,
-        "take_profit_pips": 3000,
+        "min_profit_target_usd": float(data.get("min_profit_target_usd", 0.30)),
+        "stop_loss_pips": int(data.get("stop_loss_pips", 1000)),
+        "take_profit_pips": 2000,
         "is_running": True
     })
-    asyncio.run_coroutine_threadsafe(engine.run_high_accuracy_loop(), bg_loop)
+    asyncio.run_coroutine_threadsafe(engine.run_sub_second_scalper_loop(), bg_loop)
     return jsonify(status="started")
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
     bot_state["is_running"] = False
-    add_log("Automated Scalper stop requested.")
+    add_log("Sub-second scalper stop requested.")
     return jsonify(status="stopped")
 
 @app.route("/api/close_position", methods=["POST"])
@@ -907,7 +818,7 @@ def api_close_position():
     data = request.json or {}
     pos_id = data.get("position_id")
     if pos_id and bot_state["is_connected"]:
-        asyncio.run_coroutine_threadsafe(engine.close_position_robust(pos_id), bg_loop)
+        asyncio.run_coroutine_threadsafe(engine.close_position_instant(pos_id), bg_loop)
         return jsonify(status="closing_initiated")
     return jsonify(status="failed")
 
