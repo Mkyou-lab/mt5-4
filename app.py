@@ -3,7 +3,7 @@ import asyncio
 import threading
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 from metaapi_cloud_sdk import MetaApi
 
@@ -36,10 +36,10 @@ bot = {
     "real_symbol": "BTCUSD",
     "lot": 0.01,
     "max_trades": 1,
-    "target_profit": 0.50,          # Close trade when +$0.50 (change this)
+    "target_profit": 0.50,
     "sl_points": 800,
     "positions": [],
-    "tick": {"bid": 0, "ask": 0},
+    "tick": {"bid": 0.0, "ask": 0.0},
     "direction": "WAITING",
     "logs": ["Scalper ready. Connect your MT4/MT5 account."]
 }
@@ -61,15 +61,29 @@ class Scalper:
         self.specs = {}
 
     def fix_server(self, s):
-        if not s: return s
+        if not s:
+            return s
         s = s.strip()
         s = re.sub(r"TriaI", "Trial", s, flags=re.I)
         s = re.sub(r"Triai", "Trial", s, flags=re.I)
         return s
 
+    async def get_all_accounts(self):
+        """Compatible with metaapi-cloud-sdk v28+"""
+        try:
+            # New method (v20+)
+            return await self.api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination()
+        except Exception:
+            try:
+                # Very old method fallback
+                return await self.api.metatrader_account_api.get_accounts()
+            except Exception as e:
+                log(f"Could not list accounts: {e}")
+                return []
+
     async def connect_id(self, token, acc_id):
         try:
-            log(f"Connecting with Account ID...")
+            log(f"Connecting with Account ID: {acc_id}")
             self.api = MetaApi(token)
             self.account = await self.api.metatrader_account_api.get_account(acc_id)
             return await self._ready()
@@ -82,10 +96,10 @@ class Scalper:
     async def connect_login(self, token, login, password, server, platform):
         try:
             server = self.fix_server(server)
-            log(f"Connecting → {server} | Login {login}")
+            log(f"Connecting → Server: {server} | Login: {login}")
             self.api = MetaApi(token)
 
-            accounts = await self.api.metatrader_account_api.get_accounts()
+            accounts = await self.get_all_accounts()
             found = None
             for a in accounts:
                 if str(a.login) == str(login) and server.lower() in str(a.server).lower():
@@ -93,17 +107,21 @@ class Scalper:
                     break
 
             if found:
+                log(f"Found existing account: {found.id}")
                 self.account = found
             else:
+                log("Creating new cloud account (20-40 sec)...")
                 self.account = await self.api.metatrader_account_api.create_account({
                     "name": f"Scalper-{login}",
                     "type": "cloud",
                     "login": str(login),
                     "password": str(password),
                     "server": server,
-                    "platform": "mt5" if "5" in platform else "mt4",
+                    "platform": "mt5" if "5" in str(platform).lower() else "mt4",
                     "magic": 123456
                 })
+                log(f"Account created: {self.account.id}")
+
             return await self._ready()
         except Exception as e:
             bot["error"] = str(e)
@@ -121,14 +139,16 @@ class Scalper:
             log("Deploying terminal...")
             await self.account.deploy()
 
+        log("Waiting for broker connection...")
         await self.account.wait_connected()
+
         self.conn = self.account.get_rpc_connection()
         await self.conn.connect()
         await self.conn.wait_synchronized()
 
         await self.refresh()
         bot["connected"] = True
-        bot["status"] = f"Online • {bot['account_type']}"
+        bot["status"] = f"Online • {bot.get('account_type', 'CLOUD')}"
         bot["error"] = ""
         log("✅ Connected & ready to scalp")
         return True, "OK"
@@ -153,7 +173,7 @@ class Scalper:
                     "current": float(p.get("currentPrice", 0)),
                     "profit": float(p.get("profit", 0))
                 })
-        except:
+        except Exception:
             pass
 
     async def resolve(self, sym):
@@ -161,13 +181,14 @@ class Scalper:
             symbols = await self.conn.get_symbols()
             if sym in symbols:
                 return sym
-            clean = sym.replace("/", "").replace(".", "").upper()
+            clean = sym.replace("/", "").replace(".", "").replace("_", "").upper()
             for s in symbols:
-                if clean in s.replace("/", "").replace(".", "").upper():
-                    log(f"Symbol → {s}")
+                s_clean = s.replace("/", "").replace(".", "").replace("_", "").upper()
+                if clean in s_clean or s_clean in clean:
+                    log(f"Symbol resolved: {sym} → {s}")
                     return s
             return sym
-        except:
+        except Exception:
             return sym
 
     async def get_spec(self, sym):
@@ -175,7 +196,7 @@ class Scalper:
             try:
                 s = await self.conn.get_symbol_specification(sym)
                 self.specs[sym] = {"digits": s.get("digits", 2), "point": s.get("point", 0.01)}
-            except:
+            except Exception:
                 self.specs[sym] = {"digits": 2, "point": 0.01}
         return self.specs[sym]
 
@@ -185,7 +206,7 @@ class Scalper:
             log(f"💰 Closed #{pid} in profit")
             await self.refresh()
             return True
-        except:
+        except Exception:
             try:
                 await self.conn.close_position(int(pid))
                 log(f"💰 Closed #{pid} in profit")
@@ -205,7 +226,7 @@ class Scalper:
 
             scale = 1.0 if "BTC" in sym or "ETH" in sym else point
             sl = entry - sl_pts * scale if side == "BUY" else entry + sl_pts * scale
-            tp = entry + sl_pts * 1.5 * scale if side == "BUY" else entry - sl_pts * 1.5 * scale
+            tp = entry + sl_pts * 1.8 * scale if side == "BUY" else entry - sl_pts * 1.8 * scale
 
             log(f"🚀 {side} {sym} | Lot {lot} @ {entry:.2f}")
 
@@ -226,12 +247,11 @@ class Scalper:
 
         try:
             await self.conn.subscribe_to_market_data(sym)
-        except:
+        except Exception:
             pass
 
         while bot["running"] and bot["connected"]:
             try:
-                # Live price
                 tick = await self.conn.get_symbol_price(sym)
                 bid = float(tick["bid"])
                 ask = float(tick["ask"])
@@ -242,36 +262,33 @@ class Scalper:
                 if len(self.prices) > 12:
                     self.prices.pop(0)
 
-                # Simple fast direction
                 direction = "WAITING"
                 if len(self.prices) >= 6:
                     recent = self.prices[-1] - self.prices[-3]
                     older = self.prices[-3] - self.prices[-6]
-                    strength = abs(recent)
+                    th = 2.5 if "BTC" in sym else 0.00012
 
-                    # Threshold (BTC needs bigger move)
-                    th = 3.0 if "BTC" in sym else 0.00015
-
-                    if recent > th and recent > older:
+                    if recent > th and recent > older * 0.5:
                         direction = "BUY"
                         bot["direction"] = "UP 🚀"
-                    elif recent < -th and recent < older:
+                    elif recent < -th and recent < older * 0.5:
                         direction = "SELL"
                         bot["direction"] = "DOWN 📉"
                     else:
                         bot["direction"] = "FLAT"
 
-                # Auto close when target hit
-                for p in bot["positions"]:
-                    if p["symbol"].replace("T","") in sym.replace("T","") or sym.replace("T","") in p["symbol"].replace("T",""):
+                # Auto close when target profit reached
+                for p in list(bot["positions"]):
+                    if p["symbol"].replace("T", "") in sym.replace("T", "") or sym.replace("T", "") in p["symbol"].replace("T", ""):
                         if p["profit"] >= bot["target_profit"]:
                             log(f"🎯 Target ${p['profit']:.2f} hit → closing")
                             await self.close(p["id"])
 
-                # Open new trade if free slot + clear direction
-                my_pos = [p for p in bot["positions"] if p["symbol"].replace("T","") in sym.replace("T","") or sym.replace("T","") in p["symbol"].replace("T","")]
+                # Open new trade
+                my_pos = [p for p in bot["positions"]
+                          if p["symbol"].replace("T", "") in sym.replace("T", "") or sym.replace("T", "") in p["symbol"].replace("T", "")]
                 if len(my_pos) < bot["max_trades"] and direction in ("BUY", "SELL"):
-                    log(f"⚡ Clear {direction} move detected → entering now")
+                    log(f"⚡ Clear {direction} move → entering now")
                     await self.open_trade(direction, sym, bot["lot"], bot["sl_points"])
 
                 await self.refresh()
@@ -279,7 +296,7 @@ class Scalper:
             except Exception as e:
                 log(f"Loop: {e}")
 
-            await asyncio.sleep(0.35)   # ~3 times per second
+            await asyncio.sleep(0.4)
 
         log("Scalper stopped")
 
@@ -305,7 +322,7 @@ body{background:#0a0e17;color:#c9d1d9;font-family:system-ui}
 .btn-danger{background:#da3633;border:none}
 .log{background:#010409;border:1px solid #30363d;height:220px;overflow-y:auto;font-family:monospace;font-size:12px;padding:10px;border-radius:8px;color:#3fb950}
 .online{color:#3fb950} .offline{color:#f85149}
-.big{font-size:22px;font-weight:800;font-family:monospace}
+.big{font-size:20px;font-weight:800;font-family:monospace}
 </style>
 </head>
 <body class="p-3">
@@ -388,16 +405,16 @@ body{background:#0a0e17;color:#c9d1d9;font-family:system-ui}
     <div class="mb-3">
       <label>Method</label>
       <select id="method" class="form-select" onchange="toggle()">
-        <option value="id">Account ID (best)</option>
+        <option value="id">Account ID (Recommended)</option>
         <option value="login">Login + Password + Server</option>
       </select>
     </div>
     <div id="box-id">
-      <input type="text" id="accid" class="form-control mb-3" placeholder="Account ID">
+      <input type="text" id="accid" class="form-control mb-3" placeholder="Paste Account ID here">
     </div>
     <div id="box-login" style="display:none">
       <select id="plat" class="form-select mb-2"><option value="mt5">MT5</option><option value="mt4">MT4</option></select>
-      <input type="text" id="login" class="form-control mb-2" placeholder="Login">
+      <input type="text" id="login" class="form-control mb-2" placeholder="Login" value="476924559">
       <input type="password" id="pass" class="form-control mb-2" placeholder="Password">
       <input type="text" id="server" class="form-control mb-2" placeholder="Exness-MT5Trial9" value="Exness-MT5Trial9">
     </div>
@@ -412,67 +429,87 @@ body{background:#0a0e17;color:#c9d1d9;font-family:system-ui}
 </div>
 
 <script>
-function toggle(){const m=document.getElementById('method').value;document.getElementById('box-id').style.display=m==='id'?'block':'none';document.getElementById('box-login').style.display=m==='login'?'block':'none';}
+function toggle(){
+  const m=document.getElementById('method').value;
+  document.getElementById('box-id').style.display = m==='id' ? 'block' : 'none';
+  document.getElementById('box-login').style.display = m==='login' ? 'block' : 'none';
+}
 document.querySelectorAll('[data-t]').forEach(b=>{
-  b.onclick=()=>{document.querySelectorAll('.nav-link').forEach(x=>x.classList.remove('active'));b.classList.add('active');
-  document.getElementById('t-live').style.display=b.dataset.t==='live'?'block':'none';
-  document.getElementById('t-set').style.display=b.dataset.t==='set'?'block':'none';
-  document.getElementById('t-conn').style.display=b.dataset.t==='conn'?'block':'none';}
+  b.onclick=()=>{
+    document.querySelectorAll('.nav-link').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    document.getElementById('t-live').style.display = b.dataset.t==='live'?'block':'none';
+    document.getElementById('t-set').style.display = b.dataset.t==='set'?'block':'none';
+    document.getElementById('t-conn').style.display = b.dataset.t==='conn'?'block':'none';
+  }
 });
 function chart(){
   const s=document.getElementById('sym').value;
   let tv="BINANCE:BTCUSDT";
-  if(s.includes("ETH"))tv="BINANCE:ETHUSDT";
-  if(s.includes("XAU"))tv="OANDA:XAUUSD";
-  if(s.includes("EUR"))tv="FX:EURUSD";
+  if(s.includes("ETH")) tv="BINANCE:ETHUSDT";
+  if(s.includes("XAU")) tv="OANDA:XAUUSD";
+  if(s.includes("EUR")) tv="FX:EURUSD";
   document.getElementById('tv').innerHTML="";
-  new TradingView.widget({autosize:true,symbol:tv,interval:"1",theme:"dark",container_id:"tv",hide_top_toolbar:false});
+  new TradingView.widget({autosize:true,symbol:tv,interval:"1",theme:"dark",container_id:"tv"});
 }
 async function refresh(){
-  const r=await fetch('/api/status');const d=await r.json();
-  document.getElementById('status').textContent='● '+d.status;
-  document.getElementById('status').className=d.connected?'online':'offline';
-  document.getElementById('accInfo').textContent=d.connected?`Server: ${d.server} | ${d.login}`:'Not connected';
-  document.getElementById('price').textContent=d.tick.bid.toFixed(2)+' / '+d.tick.ask.toFixed(2);
-  document.getElementById('bal').textContent='$'+d.balance.toFixed(2);
-  document.getElementById('pl').textContent=(d.profit>=0?'+':'')+d.profit.toFixed(2);
-  document.getElementById('pl').className=d.profit>=0?'big text-success':'big text-danger';
-  document.getElementById('dir').textContent=d.direction;
-  document.getElementById('log').innerHTML=d.logs.join('<br>');
-  document.getElementById('log').scrollTop=9999;
-  let h='';
-  if(d.positions.length){
-    d.positions.forEach(p=>{
-      h+=`<tr><td>${p.symbol}</td><td><span class="badge ${p.type==='BUY'?'bg-success':'bg-danger'}">${p.type}</span></td>
-      <td>${p.volume}</td><td>${p.open}</td><td>${p.current}</td>
-      <td class="${p.profit>=0?'text-success':'text-danger'}">$${p.profit.toFixed(2)}</td>
-      <td><button class="btn btn-danger btn-sm py-0" onclick="closePos('${p.id}')">Close</button></td></tr>`;
-    });
-  }else h='<tr><td colspan="7" class="text-center text-muted">No trades</td></tr>';
-  document.getElementById('pos').innerHTML=h;
-  document.getElementById('start').disabled=!d.connected||d.running;
-  document.getElementById('stop').disabled=!d.running;
+  try{
+    const r=await fetch('/api/status'); const d=await r.json();
+    document.getElementById('status').textContent='● '+d.status;
+    document.getElementById('status').className=d.connected?'online':'offline';
+    document.getElementById('accInfo').textContent=d.connected?`Server: ${d.server} | ${d.login}`:'Not connected';
+    document.getElementById('price').textContent=d.tick.bid.toFixed(2)+' / '+d.tick.ask.toFixed(2);
+    document.getElementById('bal').textContent='$'+d.balance.toFixed(2);
+    document.getElementById('pl').textContent=(d.profit>=0?'+':'')+d.profit.toFixed(2);
+    document.getElementById('pl').className=d.profit>=0?'big text-success':'big text-danger';
+    document.getElementById('dir').textContent=d.direction;
+    document.getElementById('log').innerHTML=d.logs.join('<br>');
+    document.getElementById('log').scrollTop=9999;
+
+    let h='';
+    if(d.positions && d.positions.length){
+      d.positions.forEach(p=>{
+        h+=`<tr>
+          <td>${p.symbol}</td>
+          <td><span class="badge ${p.type==='BUY'?'bg-success':'bg-danger'}">${p.type}</span></td>
+          <td>${p.volume}</td><td>${p.open}</td><td>${p.current}</td>
+          <td class="${p.profit>=0?'text-success':'text-danger'}">$${p.profit.toFixed(2)}</td>
+          <td><button class="btn btn-danger btn-sm py-0" onclick="closePos('${p.id}')">Close</button></td>
+        </tr>`;
+      });
+    } else h='<tr><td colspan="7" class="text-center text-muted">No trades</td></tr>';
+    document.getElementById('pos').innerHTML=h;
+    document.getElementById('start').disabled=!d.connected||d.running;
+    document.getElementById('stop').disabled=!d.running;
+  }catch(e){}
 }
 async function connect(){
-  const body={token:document.getElementById('token').value,method:document.getElementById('method').value,
-    account_id:document.getElementById('accid').value,login:document.getElementById('login').value,
-    password:document.getElementById('pass').value,server:document.getElementById('server').value,
-    platform:document.getElementById('plat').value};
+  const body={
+    token: document.getElementById('token').value.trim(),
+    method: document.getElementById('method').value,
+    account_id: document.getElementById('accid').value.trim(),
+    login: document.getElementById('login').value.trim(),
+    password: document.getElementById('pass').value,
+    server: document.getElementById('server').value.trim(),
+    platform: document.getElementById('plat').value
+  };
   const r=await fetch('/api/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await r.json();
-  alert(d.success?'Connected!':d.message);
+  alert(d.success ? '✅ Connected successfully!' : '❌ '+d.message);
 }
 async function start(){
   await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-    symbol:document.getElementById('sym').value,
-    lot:parseFloat(document.getElementById('lot').value),
-    max_trades:parseInt(document.getElementById('max').value),
-    target_profit:parseFloat(document.getElementById('target').value)
+    symbol: document.getElementById('sym').value,
+    lot: parseFloat(document.getElementById('lot').value),
+    max_trades: parseInt(document.getElementById('max').value),
+    target_profit: parseFloat(document.getElementById('target').value)
   })});
 }
-async function stop(){await fetch('/api/stop',{method:'POST'});}
-async function closePos(id){if(confirm('Close?'))await fetch('/api/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});}
-window.onload=()=>{chart();setInterval(refresh,800);};
+async function stop(){ await fetch('/api/stop',{method:'POST'}); }
+async function closePos(id){
+  if(confirm('Close this trade?')) await fetch('/api/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+}
+window.onload=()=>{ chart(); setInterval(refresh,800); };
 </script>
 </body>
 </html>
@@ -500,12 +537,17 @@ def api_connect():
     async def do():
         if data.get("method") == "id":
             return await engine.connect_id(token, data.get("account_id", "").strip())
-        return await engine.connect_login(token, data.get("login"), data.get("password"),
-                                          data.get("server"), data.get("platform", "mt5"))
+        return await engine.connect_login(
+            token,
+            data.get("login"),
+            data.get("password"),
+            data.get("server"),
+            data.get("platform", "mt5")
+        )
 
     fut = asyncio.run_coroutine_threadsafe(do(), bg_loop)
     try:
-        ok, msg = fut.result(timeout=90)
+        ok, msg = fut.result(timeout=100)
         return jsonify(success=ok, message=msg)
     except Exception as e:
         bot["error"] = str(e)
